@@ -15,17 +15,22 @@ import org.sdn.sdn_mobile_agent.data.model.Command
  * @param wifiController Controlador WiFi para conectar/desconectar redes
  * @param onRadioChanged Callback cuando cambia la radio activa
  * @param onLog Callback para registrar eventos en el log de la UI
+ * @param onRequestBluetoothEnable Callback para pedir al usuario que encienda BT
  */
 class CommandHandler(
     private val bleManager: BleManager,
     private val wifiController: WifiController,
     private val onRadioChanged: (String) -> Unit,
-    private val onLog: (String) -> Unit
+    private val onLog: (String) -> Unit,
+    private val onRequestBluetoothEnable: (() -> Unit)? = null
 ) {
 
     companion object {
         private const val TAG = "CommandHandler"
     }
+
+    /** Último comando pendiente de ejecutar cuando BT se habilite */
+    private var pendingBtCommand: Command? = null
 
     /**
      * Procesa un comando recibido del controlador.
@@ -48,12 +53,28 @@ class CommandHandler(
 
     /**
      * PREPARE_BT: Activa Bluetooth, inicia scan y advertising.
-     * Si el hardware soporta BLE 5.0 Coded PHY, lo utiliza
-     * para maximizar el alcance.
+     * Si BT está apagado, solicita al usuario que lo encienda y guarda el
+     * comando pendiente para re-ejecutar después.
      */
     private fun handlePrepareBt(command: Command) {
         if (!bleManager.isBluetoothEnabled) {
-            onLog("⚠ Bluetooth no está habilitado en el dispositivo")
+            onLog("⚠ Bluetooth apagado — solicitando activación al usuario...")
+            pendingBtCommand = command
+            onRequestBluetoothEnable?.invoke()
+            return
+        }
+
+        executeBtActivation()
+    }
+
+    /**
+     * Ejecuta la activación real de BLE (scan + advertising).
+     * Llamado después de que BT es habilitado.
+     */
+    fun executeBtActivation() {
+        if (!bleManager.isBluetoothEnabled) {
+            onLog("✗ Bluetooth sigue apagado — no se pudo activar BLE")
+            pendingBtCommand = null
             return
         }
 
@@ -62,7 +83,18 @@ class CommandHandler(
 
         val phyInfo = if (bleManager.supportsCodedPhy) " (Coded PHY)" else " (estándar)"
         onRadioChanged("bluetooth")
-        onLog("✓ Bluetooth activado$phyInfo - scan + advertising")
+        onLog("✓ Bluetooth activado$phyInfo — scan + advertising iniciados")
+        pendingBtCommand = null
+    }
+
+    /**
+     * Reintenta el comando BT pendiente (llamado cuando el usuario habilita BT).
+     */
+    fun retryPendingBtCommand() {
+        if (pendingBtCommand != null) {
+            onLog("Reintentando PREPARE_BT tras habilitar Bluetooth...")
+            executeBtActivation()
+        }
     }
 
     /**
@@ -92,13 +124,29 @@ class CommandHandler(
 
     /**
      * RELEASE_RADIO: Libera todas las radios.
-     * Apaga BT (scan + advertising + GATT) y desconecta WiFi de datos.
+     * Detiene BLE (scan + advertising + GATT) y desconecta WiFi de datos.
+     * Nota: En Android 13+ no se puede apagar el radio BT programáticamente,
+     * solo se detienen las operaciones BLE activas. El radio queda encendido
+     * pero inactivo (idle), listo para el siguiente comando PREPARE_BT.
      * Mantiene WiFi de control (MQTT) intacta.
      */
     private fun handleReleaseRadio(command: Command) {
+        val wasBtActive = bleManager.bleState.value != "idle"
+        val wasWifiActive = wifiController.dataWifiConnected.value
+
         bleManager.stopAll()
         wifiController.disconnectDataWifi()
         onRadioChanged("idle")
-        onLog("✓ Radios liberadas (BT off, WiFi datos off)")
+
+        val details = buildString {
+            append("✓ Radios liberadas — ")
+            if (wasBtActive) append("BLE detenido (scan/adv off)")
+            if (wasWifiActive) {
+                if (wasBtActive) append(", ")
+                append("WiFi datos desconectado")
+            }
+            if (!wasBtActive && !wasWifiActive) append("ya estaban inactivas")
+        }
+        onLog(details)
     }
 }

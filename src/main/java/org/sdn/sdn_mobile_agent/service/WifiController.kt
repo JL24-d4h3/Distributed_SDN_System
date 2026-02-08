@@ -2,12 +2,14 @@ package org.sdn.sdn_mobile_agent.service
 
 import android.content.Context
 import android.net.*
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import java.net.Inet4Address
 
 /**
  * Controla las conexiones WiFi del dispositivo.
@@ -132,24 +134,49 @@ class WifiController(private val context: Context) {
 
     /**
      * Obtiene el RSSI de la conexión WiFi actual.
+     * Usa API moderna en Android 12+ y legacy en versiones anteriores.
      * @return RSSI en dBm, -100 si no hay conexión
      */
-    @Suppress("DEPRECATION")
     fun getCurrentRssi(): Int {
         return try {
-            wifiManager.connectionInfo.rssi
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                // Android 12+: usar NetworkCapabilities
+                val network = connectivityManager.activeNetwork ?: return -100
+                val caps = connectivityManager.getNetworkCapabilities(network) ?: return -100
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    caps.signalStrength.let { if (it == Int.MIN_VALUE) -100 else it }
+                } else -100
+            } else {
+                @Suppress("DEPRECATION")
+                wifiManager.connectionInfo.rssi
+            }
         } catch (e: Exception) {
+            Log.e(TAG, "Error obteniendo RSSI", e)
             -100
         }
     }
 
     /**
      * Obtiene la dirección IP del dispositivo en la red WiFi actual.
+     * Usa LinkProperties en Android 12+ y legacy en versiones anteriores.
      * @return IP en formato "x.x.x.x" o "0.0.0.0" si no hay conexión
      */
-    @Suppress("DEPRECATION")
     fun getCurrentIp(): String {
         return try {
+            // Método moderno: usar LinkProperties
+            val network = connectivityManager.activeNetwork
+            if (network != null) {
+                val linkProps = connectivityManager.getLinkProperties(network)
+                if (linkProps != null) {
+                    val ipv4 = linkProps.linkAddresses
+                        .map { it.address }
+                        .filterIsInstance<Inet4Address>()
+                        .firstOrNull { !it.isLoopbackAddress }
+                    if (ipv4 != null) return ipv4.hostAddress ?: "0.0.0.0"
+                }
+            }
+            // Fallback: método legacy
+            @Suppress("DEPRECATION")
             val ip = wifiManager.connectionInfo.ipAddress
             if (ip == 0) return "0.0.0.0"
             String.format(
@@ -160,6 +187,7 @@ class WifiController(private val context: Context) {
                 ip shr 24 and 0xff
             )
         } catch (e: Exception) {
+            Log.e(TAG, "Error obteniendo IP", e)
             "0.0.0.0"
         }
     }

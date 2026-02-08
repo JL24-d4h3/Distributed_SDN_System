@@ -1,6 +1,7 @@
 package org.sdn.sdn_mobile_agent
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -11,6 +12,9 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 import org.sdn.sdn_mobile_agent.ui.navigation.AppNavigation
 import org.sdn.sdn_mobile_agent.ui.theme.SDNMobileAgentTheme
 import org.sdn.sdn_mobile_agent.viewmodel.MainViewModel
@@ -20,6 +24,7 @@ import org.sdn.sdn_mobile_agent.viewmodel.MainViewModel
  *
  * Responsabilidades:
  * - Solicitar permisos en tiempo de ejecución (BLE, WiFi, Location)
+ * - Manejar solicitudes de habilitación de Bluetooth
  * - Inicializar el MainViewModel
  * - Montar la UI Compose con navegación por pestañas
  *
@@ -52,6 +57,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Launcher para solicitar al usuario que encienda Bluetooth.
+     * Se activa cuando el controlador envía PREPARE_BT y BT está apagado.
+     */
+    private val bluetoothEnableLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val enabled = result.resultCode == RESULT_OK
+        Log.i(TAG, "Bluetooth enable result: enabled=$enabled")
+        viewModel.onBluetoothEnableResult(enabled)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -61,6 +78,29 @@ class MainActivity : ComponentActivity() {
 
         // Solicitar permisos necesarios
         requestRequiredPermissions()
+
+        // Observar solicitudes de habilitación de BT
+        lifecycleScope.launch {
+            viewModel.requestBluetoothEnable.collectLatest { shouldRequest ->
+                if (shouldRequest) {
+                    Log.i(TAG, "Solicitando al usuario habilitar Bluetooth...")
+                    val enableBtIntent = android.content.Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
+                    bluetoothEnableLauncher.launch(enableBtIntent)
+                }
+            }
+        }
+
+        // Si BT está apagado, pedir encenderlo al inicio para que esté listo
+        // cuando el controlador envíe PREPARE_BT
+        if (!viewModel.bleManager.isBluetoothEnabled) {
+            Log.i(TAG, "BT apagado al iniciar — solicitando activación proactiva")
+            try {
+                val enableBtIntent = android.content.Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
+                bluetoothEnableLauncher.launch(enableBtIntent)
+            } catch (e: Exception) {
+                Log.w(TAG, "No se pudo lanzar solicitud BT al inicio", e)
+            }
+        }
 
         // Montar UI Compose
         setContent {

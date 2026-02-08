@@ -11,6 +11,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import org.sdn.sdn_mobile_agent.viewmodel.MainViewModel
 
 /**
@@ -34,9 +35,19 @@ fun DashboardScreen(viewModel: MainViewModel) {
     val deviceMac by viewModel.deviceMac.collectAsState()
     val currentSession by viewModel.currentSession.collectAsState()
 
-    // Métricas que se actualizan cuando la pantalla se recompone
-    val rssi = viewModel.wifiController.getCurrentRssi()
-    val ipAddress = viewModel.wifiController.getCurrentIp()
+    // Métricas que se actualizan cada 5 segundos automáticamente
+    var rssi by remember { mutableIntStateOf(-100) }
+    var ipAddress by remember { mutableStateOf("0.0.0.0") }
+    var btEnabled by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            rssi = viewModel.wifiController.getCurrentRssi()
+            ipAddress = viewModel.wifiController.getCurrentIp()
+            btEnabled = viewModel.bleManager.isBluetoothEnabled
+            delay(5_000)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -108,7 +119,7 @@ fun DashboardScreen(viewModel: MainViewModel) {
                 },
                 details = listOf(
                     "Coded PHY: ${if (viewModel.bleManager.supportsCodedPhy) "Sí (Long Range)" else "No"}",
-                    "BT Habilitado: ${if (viewModel.bleManager.isBluetoothEnabled) "Sí" else "No"}"
+                    "BT Habilitado: ${if (btEnabled) "Sí ✓" else "No — enciéndelo manualmente"}"
                 )
             )
 

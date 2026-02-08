@@ -77,6 +77,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _deviceMac = MutableStateFlow("")
     val deviceMac: StateFlow<String> = _deviceMac
 
+    /** Señal para que la Activity solicite habilitar Bluetooth */
+    private val _requestBluetoothEnable = MutableStateFlow(false)
+    val requestBluetoothEnable: StateFlow<Boolean> = _requestBluetoothEnable
+
     private var telemetryJob: Job? = null
     private var connectionObserverJob: Job? = null
     private var errorObserverJob: Job? = null
@@ -89,7 +93,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             bleManager = bleManager,
             wifiController = wifiController,
             onRadioChanged = { radio -> _activeRadio.value = radio },
-            onLog = { msg -> addLog(msg) }
+            onLog = { msg -> addLog(msg) },
+            onRequestBluetoothEnable = {
+                _requestBluetoothEnable.value = true
+            }
         )
 
         // Registrar callback para comandos MQTT
@@ -322,6 +329,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Limpia el mensaje de error */
     fun clearError() {
         _errorMessage.value = null
+    }
+
+    /**
+     * Llamado por la Activity cuando el usuario habilita/rechaza BT.
+     * Si BT fue habilitado, reintenta el comando pendiente.
+     */
+    fun onBluetoothEnableResult(enabled: Boolean) {
+        _requestBluetoothEnable.value = false
+        if (enabled) {
+            addLog("✓ Bluetooth habilitado por el usuario")
+            commandHandler.retryPendingBtCommand()
+        } else {
+            addLog("✗ El usuario rechazó habilitar Bluetooth")
+        }
     }
 
     override fun onCleared() {
