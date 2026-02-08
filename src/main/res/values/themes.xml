@@ -1,0 +1,8 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base theme: solo se usa para el splash de la Activity.
+         La UI real es Jetpack Compose con Material 3. -->
+    <style name="Base.Theme.SDN_Mobile_Agent" parent="Theme.AppCompat.DayNight.NoActionBar">
+    </style>
+
+    <style name="Theme.SDN_Mobile_Agent" parent="Base.Theme.SDN_Mobile_Agent" />
+</resources>
