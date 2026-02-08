@@ -46,6 +46,28 @@ class MqttManager {
     var onConnectionChanged: ((Boolean) -> Unit)? = null
 
     /**
+     * Publica un pedido de control de radio al controlador.
+     * Tópico: dispositivo/{MAC}/radio-request
+     * El controlador escucha este tópico, ejecuta ADB, y responde con un
+     * comando en dispositivo/{MAC}/comando.
+     *
+     * @param action "enable_bt", "disable_bt", "enable_wifi", "disable_wifi"
+     * @param reason Razón del pedido
+     */
+    fun publishRadioRequest(action: String, reason: String) {
+        if (client?.isConnected != true) return
+        try {
+            val topic = "dispositivo/$deviceMac/radio-request"
+            val json = """{"action":"$action","reason":"$reason","mac":"$deviceMac","timestamp":${System.currentTimeMillis()}}"""
+            val message = MqttMessage(json.toByteArray()).apply { qos = 1 }
+            client?.publish(topic, message)
+            Log.i(TAG, "Radio request publicado: $action")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error publicando radio request", e)
+        }
+    }
+
+    /**
      * Conecta al broker MQTT.
      * @param brokerUrl URL del broker, ej: tcp://192.168.18.1:1883
      * @param mac MAC del dispositivo para los tópicos

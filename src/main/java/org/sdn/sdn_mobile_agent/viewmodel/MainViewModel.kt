@@ -24,6 +24,7 @@ import java.util.*
  * - MqttManager: conexión MQTT con el broker
  * - BleManager: operaciones Bluetooth LE
  * - WifiController: conexiones WiFi de datos
+ * - RadioController: control directo de radios BT/WiFi
  * - TelemetryCollector: recopilación de métricas
  * - CommandHandler: procesamiento de comandos del controlador
  * - SdnApi: comunicación REST con el controlador
@@ -44,6 +45,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val mqttManager = MqttManager()
     val bleManager = BleManager(context)
     val wifiController = WifiController(context)
+    val radioController = RadioController(context)
     private val telemetryCollector = TelemetryCollector(context, wifiController)
     private val commandHandler: CommandHandler
 
@@ -90,12 +92,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         // Configurar CommandHandler con callbacks
         commandHandler = CommandHandler(
+            radioController = radioController,
             bleManager = bleManager,
             wifiController = wifiController,
             onRadioChanged = { radio -> _activeRadio.value = radio },
             onLog = { msg -> addLog(msg) },
             onRequestBluetoothEnable = {
                 _requestBluetoothEnable.value = true
+            },
+            onPublishRadioRequest = { action, reason ->
+                mqttManager.publishRadioRequest(action, reason)
             }
         )
 
@@ -119,6 +125,250 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Obtener MAC del dispositivo
         _deviceMac.value = getDeviceMac()
         Log.i(TAG, "Device MAC: ${_deviceMac.value}")
+    }
+
+    // ─── Consola de Comandos Locales ────────────────────────────
+
+    /**
+     * Ejecuta un comando local desde la consola de búsqueda.
+     * Retorna true si era un comando reconocido, false si debe tratarse
+     * como búsqueda REST normal.
+     *
+     * Arquitectura SDN para control de radios:
+     * ═════════════════════════════════════════
+     * bt on / bt off   → Publica MQTT radio-request → Controlador ejecuta ADB
+     * prepare / release → Simula comandos PREPARE_BT / RELEASE_RADIO
+     * ble start / stop  → Control directo (funciona si BT ya está ON)
+     * status / diag     → Solo lectura, siempre funciona
+     */
+    fun executeLocalCommand(input: String): Boolean {
+        val cmd = input.trim().lowercase()
+
+        when {
+            cmd == "help" || cmd == "?" -> {
+                _searchResult.value = buildString {
+                    appendLine("═══ Consola SDN Mobile Agent ═══")
+                    appendLine()
+                    appendLine("─── Control de Radios (vía Controlador) ───")
+                    appendLine("▸ bt on         Solicitar encender BT (MQTT→ADB)")
+                    appendLine("▸ bt off        Solicitar apagar BT (MQTT→ADB)")
+                    appendLine("▸ wifi on       Solicitar encender WiFi (MQTT→ADB)")
+                    appendLine()
+                    appendLine("─── Operaciones BLE (locales) ───")
+                    appendLine("▸ ble start     Iniciar BLE scan+advertising")
+                    appendLine("▸ ble stop      Detener BLE scan+advertising")
+                    appendLine()
+                    appendLine("─── Simulación de Comandos SDN ───")
+                    appendLine("▸ prepare       Simular PREPARE_BT del controlador")
+                    appendLine("▸ release       Simular RELEASE_RADIO del controlador")
+                    appendLine()
+                    appendLine("─── Diagnóstico ───")
+                    appendLine("▸ status        Estado actual de todas las radios")
+                    appendLine("▸ diag          Diagnóstico de privilegios del sistema")
+                    appendLine("▸ adb           Comandos ADB de referencia")
+                    appendLine()
+                    appendLine("Cualquier otro texto → búsqueda REST")
+                }
+                addLog("Consola: help")
+                return true
+            }
+
+            cmd == "bt on" -> {
+                addLog("Consola: bt on")
+                if (mqttManager.isConnected.value) {
+                    mqttManager.publishRadioRequest("enable_bt", "Solicitud desde consola")
+                    _searchResult.value = buildString {
+                        appendLine("→ Solicitud enviada al controlador vía MQTT")
+                        appendLine()
+                        appendLine("Flujo:")
+                        appendLine("  App → MQTT radio-request → Controlador")
+                        appendLine("  Controlador → adb shell svc bluetooth enable")
+                        appendLine("  Controlador → MQTT BT_READY → App")
+                        appendLine()
+                        appendLine("Esperando confirmación BT_READY...")
+                    }
+                    addLog("→ Radio request enviado: enable_bt")
+                } else {
+                    _searchResult.value = buildString {
+                        appendLine("✗ MQTT no conectado")
+                        appendLine()
+                        appendLine("No se puede enviar la solicitud al controlador.")
+                        appendLine("Opciones:")
+                        appendLine("  1. Conecta MQTT primero (pestaña Config)")
+                        appendLine("  2. Ejecuta desde la laptop:")
+                        appendLine("     adb shell svc bluetooth enable")
+                    }
+                    addLog("✗ MQTT no conectado para bt on")
+                }
+                return true
+            }
+
+            cmd == "bt off" -> {
+                addLog("Consola: bt off")
+                // Detener BLE primero (local)
+                bleManager.stopAll()
+                if (mqttManager.isConnected.value) {
+                    mqttManager.publishRadioRequest("disable_bt", "Solicitud desde consola")
+                    _searchResult.value = buildString {
+                        appendLine("→ BLE detenido + solicitud enviada al controlador")
+                        appendLine()
+                        appendLine("Flujo:")
+                        appendLine("  App → BLE stop (local)")
+                        appendLine("  App → MQTT radio-request → Controlador")
+                        appendLine("  Controlador → adb shell svc bluetooth disable")
+                        appendLine("  Controlador → MQTT BT_DISABLED → App")
+                        appendLine()
+                        appendLine("Esperando confirmación BT_DISABLED...")
+                    }
+                    addLog("→ BLE detenido + radio request: disable_bt")
+                } else {
+                    _searchResult.value = buildString {
+                        appendLine("✓ BLE detenido (local)")
+                        appendLine("✗ MQTT no conectado — no se puede apagar radio BT")
+                        appendLine()
+                        appendLine("Ejecuta desde la laptop:")
+                        appendLine("  adb shell svc bluetooth disable")
+                    }
+                    addLog("✗ MQTT no conectado para bt off")
+                }
+                _activeRadio.value = "idle"
+                return true
+            }
+
+            cmd == "wifi on" -> {
+                addLog("Consola: wifi on")
+                if (mqttManager.isConnected.value) {
+                    mqttManager.publishRadioRequest("enable_wifi", "Solicitud desde consola")
+                    _searchResult.value = "→ Solicitud enviada al controlador (enable_wifi)\n\n" +
+                            "Controlador ejecutará: adb shell svc wifi enable"
+                    addLog("→ Radio request enviado: enable_wifi")
+                } else {
+                    _searchResult.value = "✗ MQTT no conectado\n\n" +
+                            "Desde la laptop: adb shell svc wifi enable"
+                    addLog("✗ MQTT no conectado para wifi on")
+                }
+                return true
+            }
+
+            cmd == "wifi off" -> {
+                addLog("Consola: wifi off")
+                _searchResult.value = "⚠ WiFi off deshabilitado — cortaría la conexión MQTT\n\n" +
+                        "Para apagar WiFi:\n" +
+                        "  Desde la laptop: adb shell svc wifi disable\n\n" +
+                        "⚠ Esto desconectará la app del broker MQTT."
+                addLog("⚠ WiFi off bloqueado (cortaría MQTT)")
+                return true
+            }
+
+            cmd == "ble start" -> {
+                addLog("Consola: ble start")
+                commandHandler.executeBtActivation()
+                _searchResult.value = if (bleManager.isBluetoothEnabled) {
+                    "✓ BLE scan + advertising iniciados"
+                } else {
+                    "✗ BT apagado — enciéndelo primero:\n" +
+                            "  Escribe: bt on\n" +
+                            "  O desde laptop: adb shell svc bluetooth enable"
+                }
+                return true
+            }
+
+            cmd == "ble stop" -> {
+                addLog("Consola: ble stop")
+                bleManager.stopAll()
+                _searchResult.value = "✓ BLE detenido (scan + advertising)"
+                _activeRadio.value = "idle"
+                addLog("✓ BLE detenido vía consola")
+                return true
+            }
+
+            cmd == "prepare" -> {
+                addLog("Consola: simular PREPARE_BT")
+                val fakeCmd = Command(
+                    sessionId = "local-test",
+                    action = "PREPARE_BT",
+                    reason = "Prueba local desde consola"
+                )
+                commandHandler.handle(fakeCmd)
+                _searchResult.value = "→ PREPARE_BT ejecutado (ver Log para detalles)"
+                return true
+            }
+
+            cmd == "release" -> {
+                addLog("Consola: simular RELEASE_RADIO")
+                val fakeCmd = Command(
+                    sessionId = "local-test",
+                    action = "RELEASE_RADIO",
+                    reason = "Prueba local desde consola"
+                )
+                commandHandler.handle(fakeCmd)
+                _searchResult.value = "→ RELEASE_RADIO ejecutado (ver Log para detalles)"
+                return true
+            }
+
+            cmd == "diag" -> {
+                val diagnostic = commandHandler.runDiagnostic()
+                _searchResult.value = diagnostic
+                addLog("Consola: diagnóstico ejecutado")
+                return true
+            }
+
+            cmd == "status" -> {
+                _searchResult.value = buildString {
+                    appendLine("═══ Estado Actual ═══")
+                    appendLine()
+                    appendLine("─── Hardware ───")
+                    appendLine("BT Radio: ${if (bleManager.isBluetoothEnabled) "ON ✓" else "OFF ✗"}")
+                    appendLine("WiFi IP: ${wifiController.getCurrentIp()}")
+                    appendLine("WiFi RSSI: ${wifiController.getCurrentRssi()} dBm")
+                    appendLine()
+                    appendLine("─── Operaciones ───")
+                    appendLine("BLE State: ${bleManager.bleState.value}")
+                    appendLine("WiFi Datos: ${if (wifiController.dataWifiConnected.value) "Conectado" else "No"}")
+                    appendLine("Radio Activa: ${_activeRadio.value}")
+                    appendLine()
+                    appendLine("─── Conexión SDN ───")
+                    appendLine("MQTT: ${if (mqttManager.isConnected.value) "Conectado ✓" else "Desconectado ✗"}")
+                    appendLine("MAC: ${_deviceMac.value}")
+                    appendLine()
+                    appendLine("─── Arquitectura ───")
+                    appendLine("Control de radios: vía Controlador (MQTT→ADB)")
+                    appendLine("Operaciones BLE: locales (directo)")
+                }
+                addLog("Consola: status")
+                return true
+            }
+
+            cmd == "adb" -> {
+                _searchResult.value = buildString {
+                    appendLine("═══ Referencia ADB ═══")
+                    appendLine()
+                    appendLine("─── Ejecutar desde la laptop ───")
+                    appendLine()
+                    appendLine("# Encender/apagar Bluetooth:")
+                    appendLine("adb shell svc bluetooth enable")
+                    appendLine("adb shell svc bluetooth disable")
+                    appendLine()
+                    appendLine("# Encender/apagar WiFi:")
+                    appendLine("adb shell svc wifi enable")
+                    appendLine("adb shell svc wifi disable")
+                    appendLine()
+                    appendLine("# Estado de radios:")
+                    appendLine("adb shell settings get global bluetooth_on")
+                    appendLine("adb shell settings get global wifi_on")
+                    appendLine()
+                    appendLine("─── Script Automático ───")
+                    appendLine("./sdn_controller_daemon.sh")
+                    appendLine("  → Escucha MQTT radio-requests y ejecuta ADB")
+                    appendLine("  → Los comandos 'bt on/off' de esta consola")
+                    appendLine("     se envían automáticamente al daemon")
+                }
+                addLog("Consola: referencia ADB")
+                return true
+            }
+
+            else -> return false // No es un comando → tratar como búsqueda REST
+        }
     }
 
     // ─── Conexión MQTT ──────────────────────────────────────────
@@ -172,9 +422,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Solicita una nueva sesión de contenido al controlador.
-     * POST /sessions/request
+     * POST /sessions/request al controlador.
+     * Si el texto empieza con un comando local, lo ejecuta directamente.
      */
     fun requestSession(query: String) {
+        // Intentar ejecutar como comando local primero
+        if (executeLocalCommand(query)) return
+
         viewModelScope.launch {
             _isLoading.value = true
             _errorMessage.value = null
@@ -350,8 +604,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         stopTelemetry()
         connectionObserverJob?.cancel()
         errorObserverJob?.cancel()
+        commandHandler.destroy()
         bleManager.stopAll()
         mqttManager.disconnect()
         Log.i(TAG, "ViewModel cleared, recursos liberados")
     }
+
+    /** Diagnóstico del nivel de control de radios disponible */
+    fun getRadioDiagnostic(): String = commandHandler.runDiagnostic()
 }

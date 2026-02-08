@@ -1,0 +1,84 @@
+[07:54:23] \033[1;33m━━━ Radio Request ━━━\033[0m
+[07:54:23]   MAC:    A2:57:0E:EF:C6:E5
+[07:54:23]   Acción: enable_bt
+[07:54:23]   Razón:  Test manual
+[07:54:23] \033[0;36m  → adb shell svc bluetooth enable\033[0m
+[07:54:25] \033[0;34m  → MQTT confirmación: BT_READY → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[07:54:25] \033[0;32m  ✓ BT encendido y verificado\033[0m
+[07:54:35] \033[1;33m━━━ Radio Request ━━━\033[0m
+[07:54:35]   MAC:    A2:57:0E:EF:C6:E5
+[07:54:35]   Acción: disable_bt
+[07:54:35]   Razón:  Test manual off
+[07:54:35] \033[0;36m  → adb shell svc bluetooth disable\033[0m
+[07:54:37] \033[0;34m  → MQTT confirmación: BT_DISABLED → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[07:54:37] \033[0;32m  ✓ BT deshabilitado\033[0m
+[08:03:07] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:03:07]   MAC:    A2:57:0E:EF:C6:E5
+[08:03:07]   Acción: disable_bt
+[08:03:07]   Razón:  Solicitud desde consola
+[08:03:07] \033[0;36m  → adb shell svc bluetooth disable\033[0m
+[08:03:08] \033[0;34m  → MQTT confirmación: BT_DISABLED → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:03:08] \033[0;32m  ✓ BT deshabilitado\033[0m
+[08:03:45] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:03:45]   MAC:    A2:57:0E:EF:C6:E5
+[08:03:45]   Acción: enable_bt
+[08:03:45]   Razón:  PREPARE_BT requiere BT encendido
+[08:03:45] \033[0;36m  → adb shell svc bluetooth enable\033[0m
+[08:03:47] \033[0;34m  → MQTT confirmación: BT_READY → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:03:47] \033[0;32m  ✓ BT encendido y verificado\033[0m
+[08:03:53] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:03:53]   MAC:    A2:57:0E:EF:C6:E5
+[08:03:53]   Acción: disable_bt
+[08:03:53]   Razón:  RELEASE_RADIO: liberando radios
+[08:03:53] \033[0;36m  → adb shell svc bluetooth disable\033[0m
+[08:03:54] \033[0;34m  → MQTT confirmación: BT_DISABLED → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:03:54] \033[0;32m  ✓ BT deshabilitado\033[0m
+[08:04:27] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:04:27]   MAC:    A2:57:0E:EF:C6:E5
+[08:04:27]   Acción: enable_wifi
+[08:04:27]   Razón:  Solicitud desde consola
+[08:04:27] \033[0;36m  → adb shell svc wifi enable\033[0m
+[08:04:29] \033[0;34m  → MQTT confirmación: WIFI_READY → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:04:29] \033[0;32m  ✓ WiFi encendido\033[0m
+[08:05:26] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:05:26]   MAC:    A2:57:0E:EF:C6:E5
+[08:05:26]   Acción: enable_wifi
+[08:05:26]   Razón:  Solicitud desde consola
+[08:05:26] \033[0;36m  → adb shell svc wifi enable\033[0m
+[08:05:28] \033[0;34m  → MQTT confirmación: WIFI_READY → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:05:28] \033[0;32m  ✓ WiFi encendido\033[0m
+[08:05:55] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:05:55]   MAC:    A2:57:0E:EF:C6:E5
+[08:05:55]   Acción: enable_bt
+[08:05:55]   Razón:  Solicitud desde consola
+[08:05:55] \033[0;36m  → adb shell svc bluetooth enable\033[0m
+[08:05:57] \033[0;34m  → MQTT confirmación: BT_READY → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:05:57] \033[0;32m  ✓ BT encendido y verificado\033[0m
+[08:06:32] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:06:32]   MAC:    A2:57:0E:EF:C6:E5
+[08:06:32]   Acción: disable_bt
+[08:06:32]   Razón:  Solicitud desde consola
+[08:06:32] \033[0;36m  → adb shell svc bluetooth disable\033[0m
+[08:06:33] \033[0;34m  → MQTT confirmación: BT_DISABLED → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:06:33] \033[0;32m  ✓ BT deshabilitado\033[0m
+[08:06:37] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:06:37]   MAC:    A2:57:0E:EF:C6:E5
+[08:06:37]   Acción: enable_bt
+[08:06:37]   Razón:  Solicitud desde consola
+[08:06:37] \033[0;36m  → adb shell svc bluetooth enable\033[0m
+[08:06:39] \033[0;34m  → MQTT confirmación: BT_READY → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:06:39] \033[0;32m  ✓ BT encendido y verificado\033[0m
+[08:06:40] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:06:40]   MAC:    A2:57:0E:EF:C6:E5
+[08:06:40]   Acción: disable_bt
+[08:06:40]   Razón:  Solicitud desde consola
+[08:06:40] \033[0;36m  → adb shell svc bluetooth disable\033[0m
+[08:06:41] \033[0;34m  → MQTT confirmación: BT_DISABLED → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:06:41] \033[0;32m  ✓ BT deshabilitado\033[0m
+[08:07:37] \033[1;33m━━━ Radio Request ━━━\033[0m
+[08:07:37]   MAC:    A2:57:0E:EF:C6:E5
+[08:07:37]   Acción: enable_wifi
+[08:07:37]   Razón:  Solicitud desde consola
+[08:07:37] \033[0;36m  → adb shell svc wifi enable\033[0m
+[08:07:40] \033[0;34m  → MQTT confirmación: WIFI_READY → dispositivo/A2:57:0E:EF:C6:E5/comando\033[0m
+[08:07:40] \033[0;32m  ✓ WiFi encendido\033[0m

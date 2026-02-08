@@ -17,13 +17,13 @@ import org.sdn.sdn_mobile_agent.viewmodel.MainViewModel
 /**
  * Pantalla principal de Dashboard.
  *
- * Muestra en tiempo real:
+ * Muestra en tiempo real (auto-refresh cada 3s):
  * - Estado de conexión MQTT
- * - Radio activa (WiFi, BT, idle)
+ * - Radio activa (WiFi, BT, idle) con estado real del hardware
  * - Estado BLE (scan, advertising, connected)
  * - Información de red (RSSI, IP)
+ * - Nivel de control de radios (Device Owner, Admin, etc.)
  * - Sesión activa (si existe)
- * - Botón para confirmar entrega
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -35,17 +35,21 @@ fun DashboardScreen(viewModel: MainViewModel) {
     val deviceMac by viewModel.deviceMac.collectAsState()
     val currentSession by viewModel.currentSession.collectAsState()
 
-    // Métricas que se actualizan cada 5 segundos automáticamente
+    // Métricas que se actualizan cada 3 segundos
     var rssi by remember { mutableIntStateOf(-100) }
-    var ipAddress by remember { mutableStateOf("0.0.0.0") }
+    var ipAddress by remember { mutableStateOf("...") }
     var btEnabled by remember { mutableStateOf(false) }
+    var isDeviceOwner by remember { mutableStateOf(false) }
+    var isDeviceAdmin by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         while (true) {
             rssi = viewModel.wifiController.getCurrentRssi()
             ipAddress = viewModel.wifiController.getCurrentIp()
             btEnabled = viewModel.bleManager.isBluetoothEnabled
-            delay(5_000)
+            isDeviceOwner = viewModel.radioController.isDeviceOwner
+            isDeviceAdmin = viewModel.radioController.isDeviceAdmin
+            delay(3_000)
         }
     }
 
@@ -75,51 +79,68 @@ fun DashboardScreen(viewModel: MainViewModel) {
                 statusText = if (isConnected) "Conectado" else "Desconectado",
                 details = listOf(
                     "MAC: $deviceMac",
-                    "IP: $ipAddress"
-                )
-            )
-
-            // ── Radio activa ──
-            StatusCard(
-                title = "Radio Activa",
-                icon = when (activeRadio) {
-                    "bluetooth" -> Icons.Default.Bluetooth
-                    "wifi" -> Icons.Default.Wifi
-                    "wifi+bluetooth" -> Icons.Default.WifiTethering
-                    else -> Icons.Default.RadioButtonUnchecked
-                },
-                isActive = activeRadio != "idle",
-                statusText = when (activeRadio) {
-                    "idle" -> "Inactivo"
-                    "bluetooth" -> "Bluetooth LE"
-                    "wifi" -> "WiFi Datos"
-                    "wifi+bluetooth" -> "WiFi + BT"
-                    "ble_coded_phy" -> "BLE Coded PHY"
-                    else -> activeRadio
-                },
-                details = listOf(
-                    "BLE: $bleState",
-                    "WiFi Datos: ${if (dataWifiConnected) "Conectado" else "No conectado"}",
+                    "IP: $ipAddress",
                     "RSSI WiFi: $rssi dBm"
                 )
             )
 
-            // ── Info BLE ──
+            // ── Estado de Radios (Hardware real) ──
+            StatusCard(
+                title = "Radios (Hardware)",
+                icon = Icons.Default.SettingsInputAntenna,
+                isActive = btEnabled || (ipAddress != "0.0.0.0" && ipAddress != "..."),
+                statusText = when {
+                    btEnabled && ipAddress != "0.0.0.0" -> "BT + WiFi ON"
+                    btEnabled -> "BT ON · WiFi OFF"
+                    ipAddress != "0.0.0.0" && ipAddress != "..." -> "BT OFF · WiFi ON"
+                    else -> "Ambos OFF"
+                },
+                details = listOf(
+                    "Bluetooth: ${if (btEnabled) "ON ✓" else "OFF ✗"}",
+                    "WiFi: ${if (ipAddress != "0.0.0.0" && ipAddress != "...") "ON ✓ ($ipAddress)" else "OFF ✗"}",
+                    "Radio SDN activa: $activeRadio"
+                )
+            )
+
+            // ── BLE Operations ──
             StatusCard(
                 title = "Bluetooth LE",
                 icon = Icons.Default.Bluetooth,
                 isActive = bleState != "idle",
                 statusText = when (bleState) {
                     "idle" -> "Inactivo"
-                    "scanning" -> "Escaneando..."
-                    "advertising" -> "Anunciando..."
+                    "scanning" -> "Escaneando"
+                    "advertising" -> "Anunciando"
                     "connected" -> "Conectado"
                     "error" -> "Error"
                     else -> bleState
                 },
                 details = listOf(
+                    "Estado: $bleState",
                     "Coded PHY: ${if (viewModel.bleManager.supportsCodedPhy) "Sí (Long Range)" else "No"}",
-                    "BT Habilitado: ${if (btEnabled) "Sí ✓" else "No — enciéndelo manualmente"}"
+                    "WiFi Datos: ${if (dataWifiConnected) "Conectado ✓" else "No conectado"}"
+                )
+            )
+
+            // ── Control de Radios (nivel de privilegios) ──
+            val controlLevel = when {
+                isDeviceOwner -> "Device Owner ✓ (control total)"
+                isDeviceAdmin -> "Device Admin (control parcial)"
+                else -> "Sin privilegios (requiere ADB)"
+            }
+            StatusCard(
+                title = "Control Radios",
+                icon = Icons.Default.AdminPanelSettings,
+                isActive = isDeviceOwner || isDeviceAdmin,
+                statusText = when {
+                    isDeviceOwner -> "Device Owner"
+                    isDeviceAdmin -> "Admin"
+                    else -> "Normal"
+                },
+                details = listOf(
+                    "Nivel: $controlLevel",
+                    "Toggle BT: ${if (isDeviceOwner) "automático" else "ADB o manual"}",
+                    "Toggle WiFi: ${if (isDeviceOwner) "automático" else "ADB o manual"}"
                 )
             )
 
