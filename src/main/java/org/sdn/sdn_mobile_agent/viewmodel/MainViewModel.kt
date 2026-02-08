@@ -79,6 +79,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var telemetryJob: Job? = null
     private var connectionObserverJob: Job? = null
+    private var errorObserverJob: Job? = null
 
     // ─── Inicialización ─────────────────────────────────────────
 
@@ -95,6 +96,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         mqttManager.onCommandReceived = { command ->
             viewModelScope.launch(Dispatchers.Main) {
                 commandHandler.handle(command)
+            }
+        }
+
+        // Observar errores de MQTT permanentemente
+        errorObserverJob = viewModelScope.launch {
+            mqttManager.lastError.collect { error ->
+                if (error != null) {
+                    addLog("✗ $error")
+                    _errorMessage.value = error
+                }
             }
         }
 
@@ -115,16 +126,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         addLog("Conectando a $brokerUrl...")
         mqttManager.connect(brokerUrl, mac)
 
-        // Observar cambios de conexión
-        connectionObserverJob?.cancel()
-        connectionObserverJob = viewModelScope.launch {
-            mqttManager.isConnected.collect { connected ->
-                if (connected) {
-                    addLog("✓ Conectado al broker MQTT")
-                    registerDevice()
-                    startTelemetry()
-                } else {
-                    stopTelemetry()
+        // Solo crear observer UNA vez
+        if (connectionObserverJob == null || connectionObserverJob?.isActive != true) {
+            connectionObserverJob = viewModelScope.launch {
+                mqttManager.isConnected.collect { connected ->
+                    if (connected) {
+                        addLog("✓ Conectado al broker MQTT")
+                        registerDevice()
+                        startTelemetry()
+                    } else {
+                        stopTelemetry()
+                    }
                 }
             }
         }
@@ -316,6 +328,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
         stopTelemetry()
         connectionObserverJob?.cancel()
+        errorObserverJob?.cancel()
         bleManager.stopAll()
         mqttManager.disconnect()
         Log.i(TAG, "ViewModel cleared, recursos liberados")

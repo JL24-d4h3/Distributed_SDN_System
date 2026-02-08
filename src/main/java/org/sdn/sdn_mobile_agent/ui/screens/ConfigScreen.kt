@@ -32,11 +32,16 @@ import org.sdn.sdn_mobile_agent.viewmodel.MainViewModel
 @Composable
 fun ConfigScreen(viewModel: MainViewModel) {
     val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     val brokerIp by viewModel.preferences.brokerIp.collectAsState(initial = "192.168.18.1")
     val brokerPort by viewModel.preferences.brokerPort.collectAsState(initial = 1883)
-    val deviceName by viewModel.preferences.deviceName.collectAsState(initial = Build.MODEL)
+    val deviceName by viewModel.preferences.deviceName.collectAsState(
+        initial = "${Build.BRAND.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
+    )
     val restPort by viewModel.preferences.restPort.collectAsState(initial = 8081)
     val isConnected by viewModel.mqttManager.isConnected.collectAsState()
+    val isConnecting by viewModel.mqttManager.isConnecting.collectAsState()
+    val mqttError by viewModel.mqttManager.lastError.collectAsState()
     val deviceMac by viewModel.deviceMac.collectAsState()
 
     var ipInput by remember(brokerIp) { mutableStateOf(brokerIp) }
@@ -52,7 +57,8 @@ fun ConfigScreen(viewModel: MainViewModel) {
                     containerColor = MaterialTheme.colorScheme.primaryContainer
                 )
             )
-        }
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { padding ->
         Column(
             modifier = Modifier
@@ -83,7 +89,7 @@ fun ConfigScreen(viewModel: MainViewModel) {
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             "BLE Coded PHY: ${
-                                if (viewModel.bleManager.supportsCodedPhy) "Soportado ✓" else "No soportado"
+                                if (viewModel.bleManager.supportsCodedPhy) "Soportado ✓" else "No soportado (usa BLE estándar)"
                             }"
                         )
                     }
@@ -140,6 +146,10 @@ fun ConfigScreen(viewModel: MainViewModel) {
                         viewModel.preferences.saveBrokerPort(portInput.toIntOrNull() ?: 1883)
                         viewModel.preferences.saveDeviceName(nameInput)
                         viewModel.preferences.saveRestPort(restPortInput.toIntOrNull() ?: 8081)
+                        snackbarHostState.showSnackbar(
+                            message = "✓ Configuración guardada",
+                            duration = SnackbarDuration.Short
+                        )
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
@@ -169,11 +179,19 @@ fun ConfigScreen(viewModel: MainViewModel) {
                         viewModel.connectMqtt(ipInput, portInput.toIntOrNull() ?: 1883)
                     },
                     modifier = Modifier.weight(1f),
-                    enabled = !isConnected
+                    enabled = !isConnected && !isConnecting
                 ) {
-                    Icon(Icons.Default.PlayArrow, contentDescription = null)
+                    if (isConnecting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                    } else {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                    }
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Conectar")
+                    Text(if (isConnecting) "Conectando..." else "Conectar")
                 }
 
                 OutlinedButton(
@@ -191,30 +209,59 @@ fun ConfigScreen(viewModel: MainViewModel) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
-                    containerColor = if (isConnected)
-                        MaterialTheme.colorScheme.primaryContainer
-                    else
-                        MaterialTheme.colorScheme.errorContainer
+                    containerColor = when {
+                        isConnected -> MaterialTheme.colorScheme.primaryContainer
+                        isConnecting -> MaterialTheme.colorScheme.tertiaryContainer
+                        mqttError != null -> MaterialTheme.colorScheme.errorContainer
+                        else -> MaterialTheme.colorScheme.errorContainer
+                    }
                 )
             ) {
                 Row(
                     modifier = Modifier.padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        if (isConnected) Icons.Default.CheckCircle else Icons.Default.Error,
-                        contentDescription = null,
-                        tint = if (isConnected)
-                            MaterialTheme.colorScheme.primary
-                        else
-                            MaterialTheme.colorScheme.error
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        if (isConnected) "Conectado al broker MQTT"
-                        else "Desconectado",
-                        style = MaterialTheme.typography.bodyLarge
-                    )
+                    when {
+                        isConnected -> {
+                            Icon(
+                                Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Conectado al broker MQTT", style = MaterialTheme.typography.bodyLarge)
+                        }
+                        isConnecting -> {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Conectando...", style = MaterialTheme.typography.bodyLarge)
+                        }
+                        mqttError != null -> {
+                            Icon(
+                                Icons.Default.Error,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                mqttError ?: "Error",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        else -> {
+                            Icon(
+                                Icons.Default.Error,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Desconectado", style = MaterialTheme.typography.bodyLarge)
+                        }
+                    }
                 }
             }
         }

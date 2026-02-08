@@ -32,7 +32,7 @@ class AppPreferences(private val context: Context) {
     }
 
     val deviceName: Flow<String> = context.dataStore.data.map { prefs ->
-        prefs[DEVICE_NAME] ?: Build.MODEL
+        prefs[DEVICE_NAME] ?: "${Build.BRAND.replaceFirstChar { it.uppercase() }} ${Build.MODEL}"
     }
 
     val restPort: Flow<Int> = context.dataStore.data.map { prefs ->

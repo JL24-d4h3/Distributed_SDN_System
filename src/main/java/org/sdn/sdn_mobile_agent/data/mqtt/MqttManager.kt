@@ -33,6 +33,12 @@ class MqttManager {
     private val _isConnected = MutableStateFlow(false)
     val isConnected: StateFlow<Boolean> = _isConnected
 
+    private val _isConnecting = MutableStateFlow(false)
+    val isConnecting: StateFlow<Boolean> = _isConnecting
+
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError
+
     /** Callback invocado cuando llega un comando del controlador */
     var onCommandReceived: ((Command) -> Unit)? = null
 
@@ -45,7 +51,26 @@ class MqttManager {
      * @param mac MAC del dispositivo para los tópicos
      */
     fun connect(brokerUrl: String, mac: String) {
+        // Evitar conexiones duplicadas
+        if (_isConnecting.value || _isConnected.value) {
+            Log.w(TAG, "Ya conectado o conectando, ignorando...")
+            return
+        }
+
+        // Limpiar cliente anterior si existe
+        try {
+            client?.let {
+                if (it.isConnected) it.disconnect()
+                it.close()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error cerrando cliente anterior", e)
+        }
+        client = null
+
         deviceMac = mac
+        _isConnecting.value = true
+        _lastError.value = null
         val clientId = "android_${mac.replace(":", "")}"
 
         try {
@@ -54,13 +79,16 @@ class MqttManager {
             client?.setCallback(object : MqttCallbackExtended {
                 override fun connectComplete(reconnect: Boolean, serverURI: String?) {
                     Log.i(TAG, "Conectado a $serverURI (reconnect=$reconnect)")
+                    _isConnecting.value = false
                     _isConnected.value = true
+                    _lastError.value = null
                     onConnectionChanged?.invoke(true)
                     subscribeToCommands()
                 }
 
                 override fun connectionLost(cause: Throwable?) {
                     Log.w(TAG, "Conexión perdida", cause)
+                    _isConnecting.value = false
                     _isConnected.value = false
                     onConnectionChanged?.invoke(false)
                 }
@@ -88,11 +116,27 @@ class MqttManager {
                 isAutomaticReconnect = true
             }
 
-            client?.connect(options)
+            client?.connect(options, null, object : IMqttActionListener {
+                override fun onSuccess(asyncActionToken: IMqttToken?) {
+                    Log.i(TAG, "Conexión exitosa a $brokerUrl")
+                    // connectComplete del callback se encargará del estado
+                }
+
+                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
+                    val errorMsg = exception?.message ?: "Error desconocido"
+                    Log.e(TAG, "Fallo al conectar a $brokerUrl: $errorMsg", exception)
+                    _isConnecting.value = false
+                    _isConnected.value = false
+                    _lastError.value = "No se pudo conectar: $errorMsg"
+                    onConnectionChanged?.invoke(false)
+                }
+            })
             Log.i(TAG, "Intentando conectar a $brokerUrl...")
         } catch (e: Exception) {
             Log.e(TAG, "Error al conectar", e)
+            _isConnecting.value = false
             _isConnected.value = false
+            _lastError.value = "Error: ${e.message}"
         }
     }
 
