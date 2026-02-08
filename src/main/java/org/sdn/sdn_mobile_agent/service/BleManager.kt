@@ -16,26 +16,52 @@ import java.util.*
 /**
  * Gestiona todas las operaciones Bluetooth Low Energy (BLE).
  *
- * Funcionalidades:
- * - Verificar soporte de BLE 5.0 Coded PHY (Long Range)
- * - Escanear dispositivos BLE (nodos de acceso ESP32/LILYGO)
- * - Advertising BLE para ser descubierto por nodos
- * - Conexión GATT con nodos de acceso
- * - Envío/recepción de datos por características BLE
+ * Arquitectura SDN — Plano de Control BLE:
+ * ═════════════════════════════════════════
+ * BT siempre ON en el celular (~0.3 mA)
+ * WiFi = Plano de Datos (toggle vía ADB por la CDN/laptop)
  *
- * UUIDs de los nodos de acceso:
- * - Servicio: 4fafc201-1fb5-459e-8fcc-c5c9c331914b
- * - TX (leer):  beb5483e-36e1-4688-b7f5-ea07361b26a8
- * - RX (escribir): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+ * Roles:
+ *   Laptop (CDN)  → GATT Server (Python, siempre ON)
+ *   Celular (App)  → GATT Client (conecta al CDN cuando necesita)
+ *
+ * GATT Service de la CDN (laptop):
+ *   SDN_SERVICE_UUID
+ *     ├─ REQUEST_CHAR   (Write)  → App escribe solicitudes JSON
+ *     ├─ RESPONSE_CHAR  (Notify) ← CDN notifica respuestas JSON
+ *     └─ CONTROL_CHAR   (Notify) ← CDN notifica comandos (WIFI_READY, etc.)
+ *
+ * Flujo típico:
+ *   1. App escanea → encuentra CDN por SDN_SERVICE_UUID
+ *   2. App conecta GATT Client → descubre servicios
+ *   3. App escribe solicitud en REQUEST_CHAR
+ *   4. CDN evalúa → si texto, responde por RESPONSE_CHAR
+ *      → si video, envía CONTROL: enable_wifi vía ADB, transmite WiFi
+ *   5. CDN envía CONTROL: disable_wifi → ADB apaga WiFi
+ *   6. App desconecta (o CDN cierra sesión)
+ *
+ * Adicionalmente mantiene scan/advertising para nodos ESP32.
  */
 class BleManager(private val context: Context) {
 
     companion object {
         private const val TAG = "BleManager"
 
-        val SERVICE_UUID: UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
-        val TX_CHAR_UUID: UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
-        val RX_CHAR_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+        // ── UUIDs del GATT Server CDN (laptop) ──
+        val SDN_SERVICE_UUID: UUID = UUID.fromString("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        /** App ESCRIBE solicitudes aquí (Write) */
+        val SDN_REQUEST_UUID: UUID = UUID.fromString("a1b2c3d4-0001-7890-abcd-ef1234567890")
+        /** CDN NOTIFICA respuestas aquí (Notify) */
+        val SDN_RESPONSE_UUID: UUID = UUID.fromString("a1b2c3d4-0002-7890-abcd-ef1234567890")
+        /** CDN NOTIFICA comandos de control aquí (Notify, ej: WIFI_READY) */
+        val SDN_CONTROL_UUID: UUID = UUID.fromString("a1b2c3d4-0003-7890-abcd-ef1234567890")
+        /** Descriptor estándar Client Characteristic Configuration */
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        // ── UUIDs de nodos de acceso (ESP32/LILYGO) ──
+        val NODE_SERVICE_UUID: UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
+        val NODE_TX_CHAR_UUID: UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
+        val NODE_RX_CHAR_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
     }
 
     private val bluetoothManager =
@@ -43,9 +69,21 @@ class BleManager(private val context: Context) {
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
     private var scanner: BluetoothLeScanner? = null
     private var advertiser: BluetoothLeAdvertiser? = null
-    private var gatt: BluetoothGatt? = null
     private var isScanning = false
     private var isAdvertising = false
+
+    // ── GATT Client hacia CDN (laptop) ──
+    private var cdnGatt: BluetoothGatt? = null
+    private var requestCharacteristic: BluetoothGattCharacteristic? = null
+
+    // ── GATT Client hacia nodos ESP32 ──
+    private var nodeGatt: BluetoothGatt? = null
+
+    /** Callback: CDN envía respuesta (contenido, datos ligeros) */
+    var onCdnResponse: ((String) -> Unit)? = null
+
+    /** Callback: CDN envía comando de control (WIFI_READY, WIFI_DISABLED, etc.) */
+    var onCdnControl: ((String) -> Unit)? = null
 
     /** Dispositivos BLE descubiertos durante el scan */
     private val _discoveredDevices = MutableStateFlow<List<ScanResult>>(emptyList())
@@ -54,6 +92,10 @@ class BleManager(private val context: Context) {
     /** Estado actual del módulo BLE */
     private val _bleState = MutableStateFlow("idle")
     val bleState: StateFlow<String> = _bleState
+
+    /** Estado de conexión con la CDN */
+    private val _cdnConnectionState = MutableStateFlow("disconnected")
+    val cdnConnectionState: StateFlow<String> = _cdnConnectionState
 
     /** Indica si el hardware soporta BLE 5.0 Coded PHY (Long Range) */
     val supportsCodedPhy: Boolean
@@ -64,6 +106,10 @@ class BleManager(private val context: Context) {
     /** Indica si Bluetooth está habilitado en el dispositivo */
     val isBluetoothEnabled: Boolean
         get() = bluetoothAdapter?.isEnabled == true
+
+    /** Indica si estamos conectados al GATT Server de la CDN */
+    val isCdnConnected: Boolean
+        get() = _cdnConnectionState.value == "ready"
 
     // ─── Verificación de permisos ───────────────────────────────
 
@@ -83,11 +129,238 @@ class BleManager(private val context: Context) {
         }
     }
 
-    // ─── Scan BLE ───────────────────────────────────────────────
+    // ════════════════════════════════════════════════════════════
+    // ═══ GATT CLIENT → CDN (Laptop) ═══════════════════════════
+    // ════════════════════════════════════════════════════════════
 
     /**
-     * Inicia un scan BLE buscando nodos de acceso por UUID de servicio.
-     * Usa Coded PHY si el hardware lo soporta.
+     * Conecta al GATT Server de la CDN (laptop).
+     * El dispositivo debe descubrirse primero vía scan con SDN_SERVICE_UUID.
+     */
+    fun connectToCdn(device: BluetoothDevice) {
+        if (!hasBlePermissions() || !isBluetoothEnabled) {
+            Log.w(TAG, "No se puede conectar a CDN: permisos=${hasBlePermissions()}, bt=$isBluetoothEnabled")
+            _cdnConnectionState.value = "error"
+            return
+        }
+
+        _cdnConnectionState.value = "connecting"
+        Log.i(TAG, "Conectando a CDN GATT Server: ${device.address}...")
+
+        try {
+            cdnGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && supportsCodedPhy) {
+                device.connectGatt(
+                    context, false, cdnGattCallback,
+                    BluetoothDevice.TRANSPORT_LE,
+                    BluetoothDevice.PHY_LE_CODED_MASK
+                )
+            } else {
+                device.connectGatt(context, false, cdnGattCallback, BluetoothDevice.TRANSPORT_LE)
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException conectando a CDN", e)
+            _cdnConnectionState.value = "error"
+        }
+    }
+
+    /**
+     * Conecta a la CDN por dirección MAC directa (sin scan previo).
+     * Útil cuando ya se conoce la MAC de la laptop.
+     */
+    fun connectToCdnByAddress(macAddress: String) {
+        if (!hasBlePermissions() || !isBluetoothEnabled) {
+            _cdnConnectionState.value = "error"
+            return
+        }
+
+        try {
+            val device = bluetoothAdapter?.getRemoteDevice(macAddress)
+            if (device != null) {
+                connectToCdn(device)
+            } else {
+                Log.e(TAG, "No se pudo obtener dispositivo para MAC: $macAddress")
+                _cdnConnectionState.value = "error"
+            }
+        } catch (e: IllegalArgumentException) {
+            Log.e(TAG, "MAC inválida: $macAddress", e)
+            _cdnConnectionState.value = "error"
+        }
+    }
+
+    /**
+     * Escribe una solicitud JSON en la CDN vía BLE GATT.
+     * La CDN la procesará y responderá por RESPONSE o CONTROL characteristic.
+     */
+    fun sendRequestToCdn(json: String): Boolean {
+        val gatt = cdnGatt ?: return false
+        val char = requestCharacteristic ?: return false
+
+        if (_cdnConnectionState.value != "ready") {
+            Log.w(TAG, "No conectado a CDN, estado: ${_cdnConnectionState.value}")
+            return false
+        }
+
+        try {
+            @Suppress("DEPRECATION")
+            char.value = json.toByteArray(Charsets.UTF_8)
+            @Suppress("DEPRECATION")
+            val success = gatt.writeCharacteristic(char)
+            Log.i(TAG, "Solicitud enviada a CDN (${json.length} bytes): ${json.take(80)}... → $success")
+            return success
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException escribiendo a CDN", e)
+            return false
+        }
+    }
+
+    /** Desconecta de la CDN */
+    fun disconnectCdn() {
+        try {
+            cdnGatt?.disconnect()
+            cdnGatt?.close()
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException desconectando CDN", e)
+        }
+        cdnGatt = null
+        requestCharacteristic = null
+        _cdnConnectionState.value = "disconnected"
+        Log.i(TAG, "Desconectado de CDN")
+    }
+
+    /** Cola de características pendientes de habilitar notificaciones */
+    private val pendingNotifyChars: Queue<BluetoothGattCharacteristic> = LinkedList()
+
+    /** Callback del GATT Client conectado a la CDN */
+    private val cdnGattCallback = object : BluetoothGattCallback() {
+
+        override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    Log.i(TAG, "Conectado al GATT Server de la CDN (status=$status)")
+                    _cdnConnectionState.value = "discovering"
+                    try {
+                        gatt?.discoverServices()
+                    } catch (e: SecurityException) {
+                        Log.e(TAG, "SecurityException descubriendo servicios CDN", e)
+                        _cdnConnectionState.value = "error"
+                    }
+                }
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    Log.i(TAG, "Desconectado del GATT Server de la CDN (status=$status)")
+                    _cdnConnectionState.value = "disconnected"
+                    requestCharacteristic = null
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.e(TAG, "Error descubriendo servicios CDN: status=$status")
+                _cdnConnectionState.value = "error"
+                return
+            }
+
+            val sdnService = gatt?.getService(SDN_SERVICE_UUID)
+            if (sdnService == null) {
+                Log.e(TAG, "Servicio SDN no encontrado en CDN")
+                _cdnConnectionState.value = "error"
+                return
+            }
+
+            // Guardar referencia a la característica de REQUEST (para escribir)
+            requestCharacteristic = sdnService.getCharacteristic(SDN_REQUEST_UUID)
+            if (requestCharacteristic == null) {
+                Log.e(TAG, "Característica REQUEST no encontrada en CDN")
+                _cdnConnectionState.value = "error"
+                return
+            }
+
+            // Habilitar notificaciones en RESPONSE
+            val responseChar = sdnService.getCharacteristic(SDN_RESPONSE_UUID)
+            if (responseChar != null) {
+                enableNotification(gatt, responseChar)
+            }
+
+            // Habilitar notificaciones en CONTROL (encolar, BLE solo permite uno a la vez)
+            val controlChar = sdnService.getCharacteristic(SDN_CONTROL_UUID)
+            if (controlChar != null) {
+                pendingNotifyChars.add(controlChar)
+            }
+
+            _cdnConnectionState.value = "ready"
+            Log.i(TAG, "✓ CDN GATT listo — REQUEST/RESPONSE/CONTROL configurados")
+        }
+
+        @Deprecated("Deprecated in API 33")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt?,
+            characteristic: BluetoothGattCharacteristic?
+        ) {
+            val data = characteristic?.value ?: return
+            val json = String(data, Charsets.UTF_8)
+            Log.i(TAG, "Notificación CDN (${characteristic.uuid}): ${json.take(120)}")
+
+            when (characteristic.uuid) {
+                SDN_RESPONSE_UUID -> onCdnResponse?.invoke(json)
+                SDN_CONTROL_UUID -> onCdnControl?.invoke(json)
+            }
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt?,
+            descriptor: BluetoothGattDescriptor?,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "CCCD escrito exitosamente para ${descriptor?.characteristic?.uuid}")
+                // Habilitar la siguiente notificación pendiente
+                val next = pendingNotifyChars.poll()
+                if (next != null && gatt != null) {
+                    enableNotification(gatt, next)
+                }
+            } else {
+                Log.e(TAG, "Error escribiendo CCCD: status=$status")
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt?,
+            characteristic: BluetoothGattCharacteristic?,
+            status: Int
+        ) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Escritura a CDN exitosa (${characteristic?.uuid})")
+            } else {
+                Log.e(TAG, "Error escribiendo a CDN: status=$status")
+            }
+        }
+    }
+
+    /** Habilita notificaciones + escribe CCCD para una característica */
+    private fun enableNotification(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+        try {
+            gatt.setCharacteristicNotification(characteristic, true)
+            val cccd = characteristic.getDescriptor(CCCD_UUID)
+            if (cccd != null) {
+                @Suppress("DEPRECATION")
+                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                @Suppress("DEPRECATION")
+                gatt.writeDescriptor(cccd)
+                Log.d(TAG, "Habilitando notificaciones para ${characteristic.uuid}")
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException habilitando notificaciones", e)
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // ═══ SCAN BLE ═════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * Inicia un scan BLE buscando:
+     * - CDN (laptop) por SDN_SERVICE_UUID
+     * - Nodos de acceso (ESP32) por NODE_SERVICE_UUID
      */
     fun startScan() {
         if (!hasBlePermissions() || !isBluetoothEnabled) {
@@ -102,12 +375,15 @@ class BleManager(private val context: Context) {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && supportsCodedPhy) {
             settingsBuilder.setPhy(BluetoothDevice.PHY_LE_CODED)
-            Log.i(TAG, "Usando Coded PHY (Long Range)")
+            Log.i(TAG, "Scan: usando Coded PHY (Long Range)")
         }
 
         val filters = listOf(
             ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid(SERVICE_UUID))
+                .setServiceUuid(ParcelUuid(SDN_SERVICE_UUID))
+                .build(),
+            ScanFilter.Builder()
+                .setServiceUuid(ParcelUuid(NODE_SERVICE_UUID))
                 .build()
         )
 
@@ -115,7 +391,7 @@ class BleManager(private val context: Context) {
             scanner?.startScan(filters, settingsBuilder.build(), scanCallback)
             isScanning = true
             _bleState.value = "scanning"
-            Log.i(TAG, "Scan BLE iniciado")
+            Log.i(TAG, "Scan BLE iniciado (CDN + nodos)")
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException al iniciar scan", e)
         }
@@ -134,12 +410,9 @@ class BleManager(private val context: Context) {
         }
     }
 
-    // ─── Advertising BLE ────────────────────────────────────────
+    // ═══ ADVERTISING BLE ═════════════════════════════════════
 
-    /**
-     * Inicia BLE advertising para que los nodos de acceso
-     * puedan descubrir este dispositivo.
-     */
+    /** Inicia BLE advertising — permite que nodos ESP32 descubran este dispositivo */
     fun startAdvertising() {
         if (!hasBlePermissions() || !isBluetoothEnabled) return
 
@@ -157,7 +430,7 @@ class BleManager(private val context: Context) {
 
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
-            .addServiceUuid(ParcelUuid(SERVICE_UUID))
+            .addServiceUuid(ParcelUuid(SDN_SERVICE_UUID))
             .build()
 
         try {
@@ -183,45 +456,37 @@ class BleManager(private val context: Context) {
         }
     }
 
-    // ─── Conexión GATT ──────────────────────────────────────────
+    // ═══ GATT CLIENT → NODOS ESP32 ══════════════════════════
 
-    /**
-     * Conecta a un dispositivo BLE (nodo de acceso) vía GATT.
-     * Usa Coded PHY si el hardware lo soporta.
-     */
-    fun connectToDevice(device: BluetoothDevice, onDataReceived: (ByteArray) -> Unit) {
+    /** Conecta a un nodo de acceso ESP32 vía GATT Client */
+    fun connectToNode(device: BluetoothDevice, onDataReceived: (ByteArray) -> Unit) {
         if (!hasBlePermissions()) return
 
         val callback = object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
-                        Log.i(TAG, "Conectado a GATT server")
-                        _bleState.value = "connected"
-                        try {
-                            gatt?.discoverServices()
-                        } catch (e: SecurityException) {
-                            Log.e(TAG, "SecurityException descubriendo servicios", e)
+                        Log.i(TAG, "Conectado a nodo ESP32: ${device.address}")
+                        try { gatt?.discoverServices() } catch (e: SecurityException) {
+                            Log.e(TAG, "SecurityException descubriendo servicios nodo", e)
                         }
                     }
-
                     BluetoothProfile.STATE_DISCONNECTED -> {
-                        Log.i(TAG, "Desconectado de GATT server")
-                        _bleState.value = "idle"
+                        Log.i(TAG, "Desconectado de nodo ESP32")
                     }
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    val service = gatt?.getService(SERVICE_UUID)
-                    val txChar = service?.getCharacteristic(TX_CHAR_UUID)
+                    val service = gatt?.getService(NODE_SERVICE_UUID)
+                    val txChar = service?.getCharacteristic(NODE_TX_CHAR_UUID)
                     txChar?.let {
                         try {
                             gatt.setCharacteristicNotification(it, true)
-                            Log.i(TAG, "Notificaciones habilitadas en TX")
+                            Log.i(TAG, "Notificaciones habilitadas en nodo TX")
                         } catch (e: SecurityException) {
-                            Log.e(TAG, "SecurityException configurando notificaciones", e)
+                            Log.e(TAG, "SecurityException configurando notificaciones nodo", e)
                         }
                     }
                 }
@@ -233,14 +498,14 @@ class BleManager(private val context: Context) {
                 characteristic: BluetoothGattCharacteristic?
             ) {
                 characteristic?.value?.let { data ->
-                    Log.d(TAG, "Datos recibidos: ${data.size} bytes")
+                    Log.d(TAG, "Datos recibidos del nodo: ${data.size} bytes")
                     onDataReceived(data)
                 }
             }
         }
 
         try {
-            gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && supportsCodedPhy) {
+            nodeGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && supportsCodedPhy) {
                 device.connectGatt(
                     context, false, callback,
                     BluetoothDevice.TRANSPORT_LE,
@@ -249,50 +514,56 @@ class BleManager(private val context: Context) {
             } else {
                 device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
             }
-            Log.i(TAG, "Conectando a ${device.address}...")
+            Log.i(TAG, "Conectando a nodo ${device.address}...")
         } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException al conectar GATT", e)
+            Log.e(TAG, "SecurityException al conectar a nodo", e)
         }
     }
 
-    /**
-     * Envía datos a un nodo de acceso por la característica RX.
-     */
-    fun sendData(data: ByteArray) {
-        val service = gatt?.getService(SERVICE_UUID)
-        val rxChar = service?.getCharacteristic(RX_CHAR_UUID)
+    /** Envía datos a un nodo ESP32 por la característica RX */
+    fun sendDataToNode(data: ByteArray) {
+        val service = nodeGatt?.getService(NODE_SERVICE_UUID)
+        val rxChar = service?.getCharacteristic(NODE_RX_CHAR_UUID)
         rxChar?.let {
             try {
                 @Suppress("DEPRECATION")
                 it.value = data
                 @Suppress("DEPRECATION")
-                gatt?.writeCharacteristic(it)
-                Log.d(TAG, "Datos enviados: ${data.size} bytes")
+                nodeGatt?.writeCharacteristic(it)
+                Log.d(TAG, "Datos enviados al nodo: ${data.size} bytes")
             } catch (e: SecurityException) {
-                Log.e(TAG, "SecurityException al escribir característica", e)
+                Log.e(TAG, "SecurityException al escribir a nodo", e)
             }
         }
     }
 
-    /** Desconecta la conexión GATT activa */
-    fun disconnectGatt() {
+    /** Desconecta del nodo ESP32 */
+    fun disconnectNode() {
         try {
-            gatt?.disconnect()
-            gatt?.close()
-            gatt = null
-            Log.i(TAG, "GATT desconectado")
+            nodeGatt?.disconnect()
+            nodeGatt?.close()
+            nodeGatt = null
+            Log.i(TAG, "Nodo GATT desconectado")
         } catch (e: SecurityException) {
-            Log.e(TAG, "SecurityException al desconectar GATT", e)
+            Log.e(TAG, "SecurityException al desconectar nodo", e)
         }
     }
 
-    /** Detiene scan, advertising y desconecta GATT */
-    fun stopAll() {
+    // ═══ UTILIDADES ═════════════════════════════════════════
+
+    /** Detiene scan, advertising, desconecta nodo (NO toca CDN) */
+    fun stopOperations() {
         stopScan()
         stopAdvertising()
-        disconnectGatt()
+        disconnectNode()
         _discoveredDevices.value = emptyList()
         _bleState.value = "idle"
+    }
+
+    /** Detiene todo incluyendo conexión CDN */
+    fun stopEverything() {
+        stopOperations()
+        disconnectCdn()
     }
 
     // ─── Callbacks ──────────────────────────────────────────────

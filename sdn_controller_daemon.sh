@@ -198,7 +198,8 @@ except:
 main() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}     SDN Controller Daemon — Radio Control Plane  ${NC}"
+    echo -e "${CYAN}     SDN Controller Daemon — Radio Control (MQTT)  ${NC}"
+    echo -e "${CYAN}     Fallback: usar sdn_ble_bridge.py (BLE GATT)  ${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════${NC}"
     echo ""
 

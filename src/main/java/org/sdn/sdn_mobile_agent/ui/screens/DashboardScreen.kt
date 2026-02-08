@@ -17,13 +17,16 @@ import org.sdn.sdn_mobile_agent.viewmodel.MainViewModel
 /**
  * Pantalla principal de Dashboard.
  *
+ * Arquitectura SDN:
+ * ═════════════════
+ * BLE  = Plano de Control (siempre ON, ~0.3 mA)
+ * WiFi = Plano de Datos (ON/OFF bajo demanda)
+ *
  * Muestra en tiempo real (auto-refresh cada 3s):
- * - Estado de conexión MQTT
- * - Radio activa (WiFi, BT, idle) con estado real del hardware
- * - Estado BLE (scan, advertising, connected)
- * - Información de red (RSSI, IP)
- * - Nivel de control de radios (Device Owner, Admin, etc.)
- * - Sesión activa (si existe)
+ * - Plano de Control BLE (GATT Server, controlador conectado)
+ * - Plano de Datos WiFi (radio ON/OFF, conexión datos)
+ * - Estado de Radios Hardware
+ * - Sesión activa
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -31,6 +34,7 @@ fun DashboardScreen(viewModel: MainViewModel) {
     val isConnected by viewModel.mqttManager.isConnected.collectAsState()
     val activeRadio by viewModel.activeRadio.collectAsState()
     val bleState by viewModel.bleManager.bleState.collectAsState()
+    val cdnConnectionState by viewModel.bleManager.cdnConnectionState.collectAsState()
     val dataWifiConnected by viewModel.wifiController.dataWifiConnected.collectAsState()
     val deviceMac by viewModel.deviceMac.collectAsState()
     val currentSession by viewModel.currentSession.collectAsState()
@@ -39,16 +43,16 @@ fun DashboardScreen(viewModel: MainViewModel) {
     var rssi by remember { mutableIntStateOf(-100) }
     var ipAddress by remember { mutableStateOf("...") }
     var btEnabled by remember { mutableStateOf(false) }
-    var isDeviceOwner by remember { mutableStateOf(false) }
-    var isDeviceAdmin by remember { mutableStateOf(false) }
+    var wifiMode by remember { mutableStateOf("...") }
+    var controllerConnected by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         while (true) {
             rssi = viewModel.wifiController.getCurrentRssi()
             ipAddress = viewModel.wifiController.getCurrentIp()
             btEnabled = viewModel.bleManager.isBluetoothEnabled
-            isDeviceOwner = viewModel.radioController.isDeviceOwner
-            isDeviceAdmin = viewModel.radioController.isDeviceAdmin
+            wifiMode = viewModel.wifiController.getWifiMode()
+            controllerConnected = viewModel.bleManager.isCdnConnected
             delay(3_000)
         }
     }
@@ -71,76 +75,65 @@ fun DashboardScreen(viewModel: MainViewModel) {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // ── Estado MQTT ──
+            // ── Plano de Control (BLE → CDN) ──
+            val bleControlActive = btEnabled && cdnConnectionState != "disconnected"
             StatusCard(
-                title = "MQTT",
-                icon = Icons.Default.Cloud,
-                isActive = isConnected,
-                statusText = if (isConnected) "Conectado" else "Desconectado",
-                details = listOf(
-                    "MAC: $deviceMac",
-                    "IP: $ipAddress",
-                    "RSSI WiFi: $rssi dBm"
-                )
-            )
-
-            // ── Estado de Radios (Hardware real) ──
-            StatusCard(
-                title = "Radios (Hardware)",
-                icon = Icons.Default.SettingsInputAntenna,
-                isActive = btEnabled || (ipAddress != "0.0.0.0" && ipAddress != "..."),
-                statusText = when {
-                    btEnabled && ipAddress != "0.0.0.0" -> "BT + WiFi ON"
-                    btEnabled -> "BT ON · WiFi OFF"
-                    ipAddress != "0.0.0.0" && ipAddress != "..." -> "BT OFF · WiFi ON"
-                    else -> "Ambos OFF"
-                },
-                details = listOf(
-                    "Bluetooth: ${if (btEnabled) "ON ✓" else "OFF ✗"}",
-                    "WiFi: ${if (ipAddress != "0.0.0.0" && ipAddress != "...") "ON ✓ ($ipAddress)" else "OFF ✗"}",
-                    "Radio SDN activa: $activeRadio"
-                )
-            )
-
-            // ── BLE Operations ──
-            StatusCard(
-                title = "Bluetooth LE",
+                title = "Plano de Control (BLE → CDN)",
                 icon = Icons.Default.Bluetooth,
-                isActive = bleState != "idle",
-                statusText = when (bleState) {
-                    "idle" -> "Inactivo"
-                    "scanning" -> "Escaneando"
-                    "advertising" -> "Anunciando"
-                    "connected" -> "Conectado"
-                    "error" -> "Error"
-                    else -> bleState
+                isActive = bleControlActive,
+                statusText = when {
+                    controllerConnected -> "CDN Conectada ✓"
+                    cdnConnectionState == "connecting" -> "Conectando..."
+                    cdnConnectionState == "discovering" -> "Descubriendo..."
+                    btEnabled -> "BT ON (sin CDN)"
+                    else -> "OFF"
                 },
                 details = listOf(
-                    "Estado: $bleState",
-                    "Coded PHY: ${if (viewModel.bleManager.supportsCodedPhy) "Sí (Long Range)" else "No"}",
-                    "WiFi Datos: ${if (dataWifiConnected) "Conectado ✓" else "No conectado"}"
+                    "BT Radio: ${if (btEnabled) "ON ✓" else "OFF ✗"}",
+                    "CDN GATT: $cdnConnectionState",
+                    "CDN conectada: ${if (controllerConnected) "Sí ✓" else "No"}",
+                    "BLE: $bleState${if (viewModel.bleManager.supportsCodedPhy) " · Coded PHY ✓" else ""}",
+                    "MAC: $deviceMac"
                 )
             )
 
-            // ── Control de Radios (nivel de privilegios) ──
-            val controlLevel = when {
-                isDeviceOwner -> "Device Owner ✓ (control total)"
-                isDeviceAdmin -> "Device Admin (control parcial)"
-                else -> "Sin privilegios (requiere ADB)"
+            // ── Plano de Datos (WiFi) ──
+            val wifiIsOn = wifiMode != "off" && wifiMode != "..."
+            val wifiStatusText = when (wifiMode) {
+                "client" -> "Cliente ($ipAddress)"
+                "hotspot" -> "Hotspot (AP)"
+                "client (sin IP)" -> "Cliente (sin IP)"
+                else -> "OFF (ahorro)"
             }
             StatusCard(
-                title = "Control Radios",
-                icon = Icons.Default.AdminPanelSettings,
-                isActive = isDeviceOwner || isDeviceAdmin,
+                title = "Plano de Datos (WiFi)",
+                icon = Icons.Default.Wifi,
+                isActive = wifiIsOn,
+                statusText = if (wifiIsOn) "Activo" else "Apagado",
+                details = listOf(
+                    "WiFi Radio: $wifiStatusText",
+                    "WiFi Datos: ${if (dataWifiConnected) "Conectado ✓" else "No"}",
+                    "RSSI: $rssi dBm",
+                    "MQTT (fallback): ${if (isConnected) "Conectado ✓" else "No"}",
+                    if (!wifiIsOn) "→ WiFi apagado = ahorro energético ✓" else "→ WiFi encendido para transferencia de datos"
+                )
+            )
+
+            // ── Radios Hardware ──
+            StatusCard(
+                title = "Resumen Radios",
+                icon = Icons.Default.SettingsInputAntenna,
+                isActive = btEnabled || wifiIsOn,
                 statusText = when {
-                    isDeviceOwner -> "Device Owner"
-                    isDeviceAdmin -> "Admin"
-                    else -> "Normal"
+                    btEnabled && wifiIsOn -> "BT + WiFi"
+                    btEnabled -> "Solo BT"
+                    wifiIsOn -> "Solo WiFi"
+                    else -> "Todo OFF"
                 },
                 details = listOf(
-                    "Nivel: $controlLevel",
-                    "Toggle BT: ${if (isDeviceOwner) "automático" else "ADB o manual"}",
-                    "Toggle WiFi: ${if (isDeviceOwner) "automático" else "ADB o manual"}"
+                    "Radio activa SDN: $activeRadio",
+                    "BT: ${if (btEnabled) "ON" else "OFF"} | WiFi: ${if (wifiIsOn) "ON" else "OFF"}",
+                    "Control: BLE GATT (nativo) / MQTT (fallback)"
                 )
             )
 

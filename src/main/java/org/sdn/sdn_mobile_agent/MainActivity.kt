@@ -90,18 +90,6 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Si BT está apagado, pedir encenderlo al inicio para que esté listo
-        // cuando el controlador envíe PREPARE_BT
-        if (!viewModel.bleManager.isBluetoothEnabled) {
-            Log.i(TAG, "BT apagado al iniciar — solicitando activación proactiva")
-            try {
-                val enableBtIntent = android.content.Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)
-                bluetoothEnableLauncher.launch(enableBtIntent)
-            } catch (e: Exception) {
-                Log.w(TAG, "No se pudo lanzar solicitud BT al inicio", e)
-            }
-        }
-
         // Montar UI Compose
         setContent {
             SDNMobileAgentTheme {

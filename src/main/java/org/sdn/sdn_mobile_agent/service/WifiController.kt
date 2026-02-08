@@ -44,6 +44,49 @@ class WifiController(private val context: Context) {
     val dataWifiConnected: StateFlow<Boolean> = _dataWifiConnected
 
     /**
+     * Verifica si el WiFi del cliente (station mode) está habilitado.
+     * NOTA: WifiManager.isWifiEnabled devuelve true también cuando el
+     * hotspot/tethering está activo (comparten la misma radio).
+     * Este método intenta distinguir entre los dos modos.
+     */
+    val isWifiClientEnabled: Boolean
+        get() = wifiManager.isWifiEnabled
+
+    /**
+     * Detecta si el hotspot/tethering WiFi está activo.
+     * Usa reflexión porque no hay API pública estable.
+     */
+    val isHotspotActive: Boolean
+        get() {
+            return try {
+                val method = wifiManager.javaClass.getDeclaredMethod("isWifiApEnabled")
+                method.isAccessible = true
+                method.invoke(wifiManager) as? Boolean ?: false
+            } catch (e: Exception) {
+                // Fallback: si WiFi está "off" pero tenemos IP, probablemente es hotspot
+                false
+            }
+        }
+
+    /**
+     * Devuelve el modo WiFi actual para mostrar en el Dashboard.
+     * - "client" → WiFi normal conectado a un router
+     * - "hotspot" → Punto de acceso (tethering) activo
+     * - "off" → WiFi radio apagado
+     */
+    fun getWifiMode(): String {
+        val hotspot = isHotspotActive
+        val clientEnabled = isWifiClientEnabled
+        val hasIp = getCurrentIp() != "0.0.0.0"
+        return when {
+            clientEnabled && hasIp -> "client"
+            hotspot -> "hotspot"
+            clientEnabled -> "client (sin IP)"
+            else -> "off"
+        }
+    }
+
+    /**
      * Conecta a una red WiFi específica para transferencia de datos.
      * Usa WifiNetworkSpecifier (API 29+) o WifiConfiguration (legacy).
      *
