@@ -2,6 +2,7 @@ package org.sdn.sdn_mobile_agent.ui.navigation
 
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -20,7 +21,7 @@ import org.sdn.sdn_mobile_agent.viewmodel.MainViewModel
 sealed class Screen(val route: String, val title: String, val icon: ImageVector) {
     data object Dashboard : Screen("dashboard", "Dashboard", Icons.Default.Dashboard)
     data object Search : Screen("search", "Buscar", Icons.Default.Search)
-    data object Log : Screen("log", "Log", Icons.Default.List)
+    data object Log : Screen("log", "Log", Icons.AutoMirrored.Filled.List)
     data object Config : Screen("config", "Config", Icons.Default.Settings)
 }
 

@@ -58,6 +58,9 @@ class BleManager(private val context: Context) {
         /** Descriptor estándar Client Characteristic Configuration */
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
+        // MAC conocida de la CDN (laptop) — fallback cuando MIUI bloquea BLE scan
+        const val CDN_MAC_FALLBACK = "C8:15:4E:EC:76:64"
+
         // ── UUIDs de nodos de acceso (ESP32/LILYGO) ──
         val NODE_SERVICE_UUID: UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
         val NODE_TX_CHAR_UUID: UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
@@ -76,6 +79,15 @@ class BleManager(private val context: Context) {
     private var cdnGatt: BluetoothGatt? = null
     private var requestCharacteristic: BluetoothGattCharacteristic? = null
 
+    // ── Reassembly buffers para mensajes chunked ──
+    private val responseBuffer = StringBuilder()
+    private val controlBuffer = StringBuilder()
+
+    // ── Auto-connect ──
+    /** MAC de la CDN para auto-reconexión */
+    private var cdnMacAddress: String? = null
+    private var autoConnectEnabled = true
+
     // ── GATT Client hacia nodos ESP32 ──
     private var nodeGatt: BluetoothGatt? = null
 
@@ -84,6 +96,9 @@ class BleManager(private val context: Context) {
 
     /** Callback: CDN envía comando de control (WIFI_READY, WIFI_DISABLED, etc.) */
     var onCdnControl: ((String) -> Unit)? = null
+
+    /** Callback: conexión GATT a CDN cambió */
+    var onCdnConnectionChanged: ((Boolean) -> Unit)? = null
 
     /** Dispositivos BLE descubiertos durante el scan */
     private val _discoveredDevices = MutableStateFlow<List<ScanResult>>(emptyList())
@@ -144,19 +159,17 @@ class BleManager(private val context: Context) {
             return
         }
 
+        // Guardar MAC para auto-reconexión
+        cdnMacAddress = device.address
         _cdnConnectionState.value = "connecting"
-        Log.i(TAG, "Conectando a CDN GATT Server: ${device.address}...")
+        // Reset reconexión completa solo en conexión fresca (no en reconnect por stale cache)
+        if (fullReconnectCount == 0) serviceDiscoveryRetries = 0
+        Log.i(TAG, "Conectando a CDN GATT Server: ${device.address} (reconnect=#$fullReconnectCount)...")
 
         try {
-            cdnGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && supportsCodedPhy) {
-                device.connectGatt(
-                    context, false, cdnGattCallback,
-                    BluetoothDevice.TRANSPORT_LE,
-                    BluetoothDevice.PHY_LE_CODED_MASK
-                )
-            } else {
-                device.connectGatt(context, false, cdnGattCallback, BluetoothDevice.TRANSPORT_LE)
-            }
+            // Siempre usar TRANSPORT_LE con 1M PHY — el servidor CDN (BlueZ)
+            // anuncia en 1M PHY; Coded PHY causa timeout status=147.
+            cdnGatt = device.connectGatt(context, false, cdnGattCallback, BluetoothDevice.TRANSPORT_LE)
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException conectando a CDN", e)
             _cdnConnectionState.value = "error"
@@ -230,25 +243,100 @@ class BleManager(private val context: Context) {
     /** Cola de características pendientes de habilitar notificaciones */
     private val pendingNotifyChars: Queue<BluetoothGattCharacteristic> = LinkedList()
 
+    /** Contador de CCCD writes pendientes antes de pasar a "ready" */
+    private var pendingCccdCount = 0
+
+    /** Guard: evitar que onMtuChanged llame discoverServices más de una vez */
+    @Volatile
+    private var serviceDiscoveryStarted = false
+
+    /** Contador de reintentos de service discovery */
+    private var serviceDiscoveryRetries = 0
+    private val MAX_SERVICE_DISCOVERY_RETRIES = 3
+
+    /** Reconexiones completas (close + re-scan) tras caché stale */
+    private var fullReconnectCount = 0
+    private val MAX_FULL_RECONNECTS = 2
+
+    /** Guard: evitar reconexiones superpuestas */
+    @Volatile
+    private var isReconnecting = false
+
+    /** Reset del contador — llamar solo desde entry points de usuario (no desde recovery) */
+    fun resetReconnectCount() {
+        fullReconnectCount = 0
+        isReconnecting = false
+    }
+
+    /**
+     * Limpia la caché GATT de Android para un dispositivo.
+     * Usa reflexión porque BluetoothGatt.refresh() es API oculta.
+     * Necesario cuando BlueZ cambia servicios y Android cachea los viejos.
+     */
+    private fun refreshGattCache(gatt: BluetoothGatt): Boolean {
+        return try {
+            val method = gatt.javaClass.getMethod("refresh")
+            val result = method.invoke(gatt) as Boolean
+            Log.i(TAG, "GATT cache refresh: $result")
+            result
+        } catch (e: Exception) {
+            Log.w(TAG, "BluetoothGatt.refresh() no disponible: ${e.message}")
+            false
+        }
+    }
+
     /** Callback del GATT Client conectado a la CDN */
     private val cdnGattCallback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.i(TAG, "Conectado al GATT Server de la CDN (status=$status)")
+                    Log.i(TAG, "Conectado al GATT Server de la CDN (status=$status, reconnect=#$fullReconnectCount)")
                     _cdnConnectionState.value = "discovering"
-                    try {
-                        gatt?.discoverServices()
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "SecurityException descubriendo servicios CDN", e)
-                        _cdnConnectionState.value = "error"
+                    serviceDiscoveryStarted = false
+                    serviceDiscoveryRetries = 0  // reset per-connection retries
+                    // Limpiar caché GATT de Android — BlueZ puede haber cambiado servicios
+                    // En reconexión (close+re-scan) no llamar refresh(), close() ya limpió
+                    if (gatt != null && fullReconnectCount == 0) {
+                        refreshGattCache(gatt)
+                    } else {
+                        Log.i(TAG, "Reconexión #$fullReconnectCount — skip refresh (close ya limpió)")
                     }
+                    // Paso 1: Negociar MTU con delay post-refresh.
+                    // refresh() necesita ~1.5s para que Android realmente limpie la caché
+                    // antes de hacer cualquier operación GATT.
+                    val mtuDelay = if (fullReconnectCount > 0) 500L else 1500L
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        try {
+                            Log.i(TAG, "Solicitando MTU 512 (post-refresh delay=${mtuDelay}ms)")
+                            gatt?.requestMtu(512)
+                        } catch (e: SecurityException) {
+                            Log.e(TAG, "SecurityException al solicitar MTU", e)
+                            try { gatt?.discoverServices() } catch (_: SecurityException) {}
+                        }
+                    }, mtuDelay)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.i(TAG, "Desconectado del GATT Server de la CDN (status=$status)")
                     _cdnConnectionState.value = "disconnected"
                     requestCharacteristic = null
+                    serviceDiscoveryStarted = false
+                    onCdnConnectionChanged?.invoke(false)
+                    // CRÍTICO: cerrar el GATT viejo para evitar leak de recursos BLE.
+                    // Sin esto, Android acumula conexiones GATT fantasma que corrompen el stack.
+                    try {
+                        gatt?.close()
+                    } catch (_: SecurityException) {}
+                    if (cdnGatt == gatt) cdnGatt = null
+                    // Auto-reconectar si fue desconexión inesperada
+                    if (autoConnectEnabled && cdnMacAddress != null && !isReconnecting) {
+                        isReconnecting = true
+                        Log.i(TAG, "Intentando auto-reconexión a CDN en 3s...")
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            isReconnecting = false
+                            connectToCdnByAddress(cdnMacAddress!!)
+                        }, 3000)
+                    }
                 }
             }
         }
@@ -260,35 +348,122 @@ class BleManager(private val context: Context) {
                 return
             }
 
+            // Log todos los servicios descubiertos para debug
+            val allServices = gatt?.services ?: emptyList()
+            Log.i(TAG, "Servicios encontrados (${allServices.size}): ${allServices.map { it.uuid }}")
+
             val sdnService = gatt?.getService(SDN_SERVICE_UUID)
             if (sdnService == null) {
-                Log.e(TAG, "Servicio SDN no encontrado en CDN")
+                serviceDiscoveryRetries++
+                if (serviceDiscoveryRetries <= MAX_SERVICE_DISCOVERY_RETRIES) {
+                    Log.w(TAG, "Servicio SDN no encontrado — reintento $serviceDiscoveryRetries/$MAX_SERVICE_DISCOVERY_RETRIES en 500ms")
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        try {
+                            serviceDiscoveryStarted = false
+                            gatt?.discoverServices()
+                            serviceDiscoveryStarted = true
+                        } catch (_: SecurityException) {
+                            _cdnConnectionState.value = "error"
+                        }
+                    }, 500)
+                    return
+                }
+
+                // ── Caché GATT stale → cerrar y reconectar ──
+                if (fullReconnectCount < MAX_FULL_RECONNECTS) {
+                    fullReconnectCount++
+                    Log.w(TAG, "Caché GATT stale → disconnect + close + re-scan #$fullReconnectCount/$MAX_FULL_RECONNECTS")
+                    serviceDiscoveryStarted = false
+                    serviceDiscoveryRetries = 0
+                    isReconnecting = true
+                    try {
+                        gatt?.disconnect()  // señalizar desconexión al remoto
+                    } catch (_: SecurityException) {}
+                    try {
+                        gatt?.close()  // close() limpia recursos + caché local
+                    } catch (_: SecurityException) {}
+                    cdnGatt = null
+                    requestCharacteristic = null
+                    _cdnConnectionState.value = "reconnecting"
+
+                    // Esperar que BlueZ y Android limpien estado, luego re-scan
+                    // Delay largo (4s) para que el stack BT realmente descarte la caché
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        isReconnecting = false
+                        Log.i(TAG, "Re-scanning CDN tras close (intento #$fullReconnectCount)...")
+                        scanAndConnectCdn()
+                    }, 4000)
+                    return
+                }
+
+                // Máximo de reconexiones alcanzado — informar al usuario.
+                // BT NUNCA se desactiva programáticamente: es el plano de control SDN.
+                Log.e(TAG, "Servicio SDN no encontrado tras $MAX_FULL_RECONNECTS reconexiones completas.")
+                Log.e(TAG, "Posibles causas: servidor GATT no corriendo con sudo, instancias duplicadas, o BlueZ corrupto.")
+                Log.e(TAG, "Solución: en laptop → sudo pkill -f sdn_cdn_gatt && sudo systemctl restart bluetooth && sudo python3 sdn_cdn_gatt.py ...")
                 _cdnConnectionState.value = "error"
+                fullReconnectCount = 0
+                isReconnecting = false
                 return
             }
 
             // Guardar referencia a la característica de REQUEST (para escribir)
             requestCharacteristic = sdnService.getCharacteristic(SDN_REQUEST_UUID)
+            fullReconnectCount = 0  // Reset: conexión exitosa
             if (requestCharacteristic == null) {
                 Log.e(TAG, "Característica REQUEST no encontrada en CDN")
                 _cdnConnectionState.value = "error"
                 return
             }
 
-            // Habilitar notificaciones en RESPONSE
+            // Habilitar notificaciones en RESPONSE y CONTROL (serializadas)
             val responseChar = sdnService.getCharacteristic(SDN_RESPONSE_UUID)
-            if (responseChar != null) {
-                enableNotification(gatt, responseChar)
-            }
-
-            // Habilitar notificaciones en CONTROL (encolar, BLE solo permite uno a la vez)
             val controlChar = sdnService.getCharacteristic(SDN_CONTROL_UUID)
+
+            // Encolar CONTROL para después de RESPONSE
             if (controlChar != null) {
                 pendingNotifyChars.add(controlChar)
             }
 
-            _cdnConnectionState.value = "ready"
-            Log.i(TAG, "✓ CDN GATT listo — REQUEST/RESPONSE/CONTROL configurados")
+            // pendingCccdCount = cuántos CCCD writes faltan antes de estar "ready"
+            pendingCccdCount = (if (responseChar != null) 1 else 0) + (if (controlChar != null) 1 else 0)
+
+            if (responseChar != null) {
+                enableNotification(gatt, responseChar)
+            } else if (pendingCccdCount == 0) {
+                // No hay características de notificación, estamos listos
+                _cdnConnectionState.value = "ready"
+                Log.i(TAG, "✓ CDN GATT listo (sin notificaciones)")
+                onCdnConnectionChanged?.invoke(true)
+            }
+
+            Log.i(TAG, "Servicios descubiertos — configurando $pendingCccdCount notificaciones...")
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.i(TAG, "MTU negociado: $mtu bytes")
+            } else {
+                Log.w(TAG, "MTU negotiation failed: status=$status (continuando con MTU default)")
+            }
+            // Guard: algunos dispositivos (Motorola, etc.) disparan onMtuChanged 2 veces.
+            // Solo llamar discoverServices una vez.
+            if (serviceDiscoveryStarted) {
+                Log.w(TAG, "onMtuChanged duplicado — ignorando (discoverServices ya iniciado)")
+                return
+            }
+            serviceDiscoveryStarted = true
+            // Paso 2: Ahora que MTU terminó, descubrir servicios.
+            // Delay mínimo de 300ms para estabilización post-MTU.
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    Log.i(TAG, "Descubriendo servicios CDN (reconnect=#$fullReconnectCount)...")
+                    gatt?.discoverServices()
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "SecurityException descubriendo servicios CDN", e)
+                    _cdnConnectionState.value = "error"
+                }
+            }, 300)
         }
 
         @Deprecated("Deprecated in API 33")
@@ -297,12 +472,59 @@ class BleManager(private val context: Context) {
             characteristic: BluetoothGattCharacteristic?
         ) {
             val data = characteristic?.value ?: return
-            val json = String(data, Charsets.UTF_8)
-            Log.i(TAG, "Notificación CDN (${characteristic.uuid}): ${json.take(120)}")
+            if (data.isEmpty()) return
+
+            // Protocolo de chunking: byte 0 = flag, bytes 1..N = payload
+            val flag = data[0].toInt() and 0xFF
+            val payload = if (data.size > 1) String(data, 1, data.size - 1, Charsets.UTF_8) else ""
 
             when (characteristic.uuid) {
-                SDN_RESPONSE_UUID -> onCdnResponse?.invoke(json)
-                SDN_CONTROL_UUID -> onCdnControl?.invoke(json)
+                SDN_RESPONSE_UUID -> {
+                    when (flag) {
+                        0x00 -> { // SINGLE — mensaje completo
+                            responseBuffer.clear()
+                            Log.i(TAG, "Respuesta CDN (single): ${payload.take(120)}")
+                            onCdnResponse?.invoke(payload)
+                        }
+                        0x01 -> { // FIRST — inicio de mensaje
+                            responseBuffer.clear()
+                            responseBuffer.append(payload)
+                            Log.d(TAG, "Respuesta CDN chunk START (${payload.length}B)")
+                        }
+                        0x02 -> { // CONT — continuación
+                            responseBuffer.append(payload)
+                            Log.d(TAG, "Respuesta CDN chunk CONT (+${payload.length}B = ${responseBuffer.length}B)")
+                        }
+                        0x03 -> { // LAST — fin de mensaje
+                            responseBuffer.append(payload)
+                            val complete = responseBuffer.toString()
+                            responseBuffer.clear()
+                            Log.i(TAG, "Respuesta CDN (${complete.length}B reassembled): ${complete.take(120)}")
+                            onCdnResponse?.invoke(complete)
+                        }
+                    }
+                }
+                SDN_CONTROL_UUID -> {
+                    when (flag) {
+                        0x00 -> {
+                            controlBuffer.clear()
+                            Log.i(TAG, "Control CDN (single): ${payload.take(120)}")
+                            onCdnControl?.invoke(payload)
+                        }
+                        0x01 -> {
+                            controlBuffer.clear()
+                            controlBuffer.append(payload)
+                        }
+                        0x02 -> controlBuffer.append(payload)
+                        0x03 -> {
+                            controlBuffer.append(payload)
+                            val complete = controlBuffer.toString()
+                            controlBuffer.clear()
+                            Log.i(TAG, "Control CDN (${complete.length}B reassembled): ${complete.take(120)}")
+                            onCdnControl?.invoke(complete)
+                        }
+                    }
+                }
             }
         }
 
@@ -313,13 +535,20 @@ class BleManager(private val context: Context) {
         ) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "CCCD escrito exitosamente para ${descriptor?.characteristic?.uuid}")
+                pendingCccdCount--
                 // Habilitar la siguiente notificación pendiente
                 val next = pendingNotifyChars.poll()
                 if (next != null && gatt != null) {
                     enableNotification(gatt, next)
+                } else if (pendingCccdCount <= 0 && _cdnConnectionState.value != "ready") {
+                    // Todas las notificaciones habilitadas → LISTO
+                    _cdnConnectionState.value = "ready"
+                    Log.i(TAG, "✓ CDN GATT listo — REQUEST/RESPONSE/CONTROL configurados")
+                    onCdnConnectionChanged?.invoke(true)
                 }
             } else {
                 Log.e(TAG, "Error escribiendo CCCD: status=$status")
+                pendingCccdCount--
             }
         }
 
@@ -562,8 +791,114 @@ class BleManager(private val context: Context) {
 
     /** Detiene todo incluyendo conexión CDN */
     fun stopEverything() {
+        autoConnectEnabled = false
         stopOperations()
         disconnectCdn()
+    }
+
+    /** Habilita o deshabilita auto-reconexión a CDN */
+    fun setAutoConnect(enabled: Boolean) {
+        autoConnectEnabled = enabled
+    }
+
+    /**
+     * Escanea, busca la CDN por UUID y conecta automáticamente.
+     * Se auto-detiene el scan al encontrar la CDN.
+     */
+    fun scanAndConnectCdn() {
+        if (!hasBlePermissions() || !isBluetoothEnabled) {
+            Log.w(TAG, "No se puede escanear CDN: permisos=${hasBlePermissions()}, bt=$isBluetoothEnabled")
+            return
+        }
+
+        _cdnConnectionState.value = "scanning"
+        // NO resetear fullReconnectCount aquí — puede ser llamado desde recovery por caché stale
+        Log.i(TAG, "Escaneando para auto-conectar a CDN (reconnect=#$fullReconnectCount)...")
+
+        scanner = bluetoothAdapter?.bluetoothLeScanner
+
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        // MIUI/HyperOS deniega scans sin filtro → usar UUID filter para pasar la check.
+        // El filtro HW puede no coincidir (UUID en scan response), pero MIUI permite el scan.
+        // La coincidencia real se hace en onScanResult por nombre/UUID del scan record.
+        val miuiFilter = ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid(SDN_SERVICE_UUID))
+            .build()
+
+        var cdnFound = false  // Guard: evitar doble conexión
+
+        // Función auxiliar para evaluar un ScanResult
+        fun evaluateResult(sr: ScanResult): Boolean {
+            if (cdnFound) return false
+            val name = sr.scanRecord?.deviceName ?: try { sr.device.name } catch (_: SecurityException) { null } ?: ""
+            val uuids = sr.scanRecord?.serviceUuids ?: emptyList()
+            val matchByUuid = uuids.any { it.uuid == SDN_SERVICE_UUID }
+            val matchByName = name == "SDN-CDN"
+
+            Log.d(TAG, "Scan: ${sr.device.address} name='$name' uuids=$uuids rssi=${sr.rssi}")
+
+            return matchByUuid || matchByName
+        }
+
+        val autoCallback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult?) {
+                if (cdnFound) return
+                result?.let { sr ->
+                    if (evaluateResult(sr)) {
+                        cdnFound = true
+                        try { scanner?.stopScan(this) } catch (_: SecurityException) {}
+                        // Scan descubre CDN en dirección LE random; conectar
+                        // siempre por la dirección pública para que BlueZ sirva
+                        // el GATT Application completo.
+                        val publicMac = cdnMacAddress ?: CDN_MAC_FALLBACK
+                        Log.i(TAG, "CDN encontrada: ${sr.device.address} (scan) — conectando por MAC pública $publicMac")
+                        connectToCdnByAddress(publicMac)
+                    }
+                }
+            }
+
+            override fun onBatchScanResults(results: MutableList<ScanResult>?) {
+                if (cdnFound) return
+                results?.forEach { sr ->
+                    if (evaluateResult(sr)) {
+                        cdnFound = true
+                        try { scanner?.stopScan(this) } catch (_: SecurityException) {}
+                        val publicMac = cdnMacAddress ?: CDN_MAC_FALLBACK
+                        Log.i(TAG, "CDN encontrada (batch): ${sr.device.address} (scan) — conectando por MAC pública $publicMac")
+                        connectToCdnByAddress(publicMac)
+                        return
+                    }
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                Log.w(TAG, "Scan CDN fallido ($errorCode) → conexión directa por MAC")
+                val mac = cdnMacAddress ?: CDN_MAC_FALLBACK
+                connectToCdnByAddress(mac)
+            }
+        }
+
+        try {
+            scanner?.startScan(listOf(miuiFilter), settings, autoCallback)
+            // Si no encuentra CDN en 8s, intentar conexión directa por MAC conocida
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (_cdnConnectionState.value == "scanning") {
+                    try {
+                        scanner?.stopScan(autoCallback)
+                    } catch (_: SecurityException) {}
+                    // Fallback: MIUI puede bloquear scan → conectar directo por MAC
+                    val mac = cdnMacAddress ?: CDN_MAC_FALLBACK
+                    Log.w(TAG, "Scan sin resultados (MIUI?) → conexión directa a $mac")
+                    connectToCdnByAddress(mac)
+                }
+            }, 8000)
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException al escanear CDN", e)
+            _cdnConnectionState.value = "error"
+        }
     }
 
     // ─── Callbacks ──────────────────────────────────────────────
